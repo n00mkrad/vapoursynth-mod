@@ -24,6 +24,8 @@
 #include "../core/version.h"
 #include "printgraph.h"
 #include "vsjson.h"
+#include "nut.h"
+#include <array>
 #include <string>
 #include <map>
 #include <vector>
@@ -33,6 +35,7 @@
 #include <chrono>
 #include <charconv>
 #include <filesystem>
+#include <memory>
 #include "../common/wave.h"
 #ifdef VS_TARGET_OS_WINDOWS
 #include <io.h>
@@ -91,6 +94,7 @@ enum class VSPipeMode {
 enum class VSPipeHeaders {
     None,
     Y4M,
+    NUT,
     WAVE,
     WAVE64
 };
@@ -163,6 +167,10 @@ struct VSPipeOutputData {
 
     /* JSON output */
     FILE *jsonFile = nullptr;
+
+    /* NUT output */
+    std::unique_ptr<VSPipeNUTWriter> nutWriter;
+    size_t nutFrameSize = 0;
 };
 
 /////////////////////////////////////////////
@@ -353,6 +361,11 @@ static void VS_CC frameDoneCallback(void *userData, const VSFrame *f, int n, VSN
                         data->totalFrames = data->requestedFrames;
                         data->outputError = true;
                     }
+                } else if (data->outputHeaders == VSPipeHeaders::NUT && data->nutWriter) {
+                    if (!data->nutWriter->writeFrameHeader(data->outputFrames, data->nutFrameSize, true, data->errorMessage)) {
+                        data->totalFrames = data->requestedFrames;
+                        data->outputError = true;
+                    }
                 }
 
                 outputFrame(frame, data);
@@ -450,7 +463,7 @@ static std::string floatBitsToLetter(int bits) {
 }
 
 static bool initializeVideoOutput(VSPipeOutputData *data) {
-    if (data->outputHeaders != VSPipeHeaders::None && data->outputHeaders != VSPipeHeaders::Y4M) {
+    if (data->outputHeaders != VSPipeHeaders::None && data->outputHeaders != VSPipeHeaders::Y4M && data->outputHeaders != VSPipeHeaders::NUT) {
         fprintf(stderr, "Error: can't apply selected header type to video\n");
         return false;
     }
@@ -512,6 +525,40 @@ static bool initializeVideoOutput(VSPipeOutputData *data) {
                 return false;
             }
         }
+    } else if (data->outputHeaders == VSPipeHeaders::NUT) {
+        std::array<uint8_t, 4> fourCC{};
+        if (vi->format.colorFamily != cfRGB) {
+            fprintf(stderr, "Error: NUT output in v1 only supports RGB clips\n");
+            return false;
+        }
+        if (data->alphaNode) {
+            fprintf(stderr, "Error: NUT output in v1 does not support alpha output\n");
+            return false;
+        }
+        if (vi->fpsNum <= 0 || vi->fpsDen <= 0) {
+            fprintf(stderr, "Error: NUT output in v1 requires a fixed and known fps\n");
+            return false;
+        }
+        if (!VSPipeNUTWriter::getRGBFourCC(vi->format, fourCC)) {
+            fprintf(stderr, "Error: no NUT fourcc exists for current RGB format\n");
+            return false;
+        }
+
+        data->nutFrameSize = 0;
+        for (int p = 0; p < vi->format.numPlanes; p++) {
+            int width = vi->width >> ((p == 1 || p == 2) ? vi->format.subSamplingW : 0);
+            int height = vi->height >> ((p == 1 || p == 2) ? vi->format.subSamplingH : 0);
+            data->nutFrameSize += static_cast<size_t>(width) * static_cast<size_t>(height) * vi->format.bytesPerSample;
+        }
+
+        data->nutWriter.reset(new VSPipeNUTWriter());
+        if (!data->nutWriter->initialize(data->outFile, vi, data->errorMessage)) {
+            if (!data->errorMessage.empty())
+                fprintf(stderr, "%s\n", data->errorMessage.c_str());
+            else
+                fprintf(stderr, "Error: failed to initialize NUT output\n");
+            return false;
+        }
     }
 
     if (data->timecodesFile && !data->outputError) {
@@ -544,6 +591,11 @@ static bool finalizeVideoOutput(VSPipeOutputData *data) {
 }
 
 static bool initializeAudioOutput(VSPipeOutputData *data) {
+    if (data->outputHeaders == VSPipeHeaders::NUT) {
+        fprintf(stderr, "Error: NUT output in v1 only supports RGB video clips\n");
+        return false;
+    }
+
     if (data->outputHeaders != VSPipeHeaders::None && data->outputHeaders != VSPipeHeaders::WAVE && data->outputHeaders != VSPipeHeaders::WAVE64) {
         fprintf(stderr, "Error: can't apply apply selected header type to audio\n");
         return false;
@@ -660,7 +712,8 @@ static void printHelp() {
         "  -e, --end N                      Set output frame/sample range end (inclusive)\n"
         "  -o, --outputindex N              Select output index\n"
         "  -r, --requests N                 Set number of concurrent frame requests\n"
-        "  -c, --container <y4m/wav/w64>    Add headers for the specified format to the output\n"
+        "  -c, --container <y4m/nut/wav/w64> Add headers for the specified format to the output\n"
+        "                                   NUT currently supports RGB clips with fixed fps and no alpha output\n"
         "  -t, --timecodes FILE             Write timecodes v2 file\n"
         "  -j, --json FILE                  Write properties of output frames in json format to file\n"
         "  -p, --progress                   Print progress to stderr\n"
@@ -714,6 +767,8 @@ static int parseOptions(VSPipeOptions &opts, int argc, char **argv) {
             std::string_view optString = argv[arg + 1];
             if (optString == "y4m") {
                 opts.outputHeaders = VSPipeHeaders::Y4M;
+            } else if (optString == "nut") {
+                opts.outputHeaders = VSPipeHeaders::NUT;
             } else if (optString == "wav") {
                 opts.outputHeaders = VSPipeHeaders::WAVE;
             } else if (optString == "w64") {

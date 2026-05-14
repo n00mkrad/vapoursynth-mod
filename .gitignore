@@ -108,3 +108,7 @@ vsrepo/
 zimg/
 !subprojects/packagefiles/*
 .wraplock
+/src/nut
+/build_portable
+/doc
+/src/ttmep

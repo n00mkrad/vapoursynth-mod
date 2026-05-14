@@ -254,6 +254,7 @@ endif
 executable('vspipe',
     files(
         'src/common/wave.cpp',
+        'src/vspipe/nut.cpp',
         'src/vspipe/printgraph.cpp',
         'src/vspipe/vsjson.cpp',
         'src/vspipe/vspipe.cpp',
