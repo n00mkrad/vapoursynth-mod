@@ -23,6 +23,7 @@
 - Stream header packet
 - Initial syncpoint packet
 - Frame headers before each frame payload
+- Syncpoint `back_ptr_div16` is derived from the distance to the previous syncpoint start, matching reference muxer behavior.
 
 Header packet/footer layout follows the reference behavior:
 - Startcode (64-bit big-endian)
@@ -35,6 +36,10 @@ Header packet/footer layout follows the reference behavior:
 - One NUT packet per VapourSynth frame.
 - One stream (`stream_id = 0`).
 - Monotonic PTS in frame order.
+- PTS source:
+  - Prefer `_AbsoluteTime` frame property when present.
+  - Advance with `_DurationNum/_DurationDen` frame duration converted to NUT ticks.
+  - Fallback to CFR-derived duration ticks when duration properties are missing.
 - Keyframe flag set on every frame for v1 simplicity.
 - Frame payload uses existing `vspipe` raw plane output behavior:
   - RGB planes in current GBR remap order.
@@ -45,16 +50,21 @@ Header packet/footer layout follows the reference behavior:
   - Integer: `G3[0][8]`, `G3[0][9]`, `G3[0][10]`, `G3[0][12]`, `G3[0][14]`, `G3[0][16]`
   - Float: `G3[0][17]` (16-bit float), `G3[0][33]` (32-bit float)
 - Gray family (new):
-  - Integer: `Y1[0][8/9/10/12/14/16]`
+  - Integer 8-bit: `Y800` (legacy compatibility tag)
+  - Integer >8-bit: `Y1[0][9/10/12/14/16]`
 - YUV family (new):
-  - Integer 4:2:0: `Y3[11][8/9/10/12/14/16]`
-  - Integer 4:2:2: `Y3[10][8/9/10/12/14/16]`
-  - Integer 4:4:4: `Y3[0][8/9/10/12/14/16]`
+  - Integer 8-bit:
+    - 4:2:0: `I420` (legacy compatibility tag)
+    - 4:2:2: `422P` (legacy compatibility tag)
+    - 4:4:4: `444P` (legacy compatibility tag)
+  - Integer >8-bit:
+    - 4:2:0: `Y3[11][9/10/12/14/16]`
+    - 4:2:2: `Y3[10][9/10/12/14/16]`
+    - 4:4:4: `Y3[0][9/10/12/14/16]`
 
 ## v1 validation rules in `vspipe`
 - `-c nut` requires:
   - Video output
-  - `fpsNum > 0 && fpsDen > 0`
   - no alpha output node
   - format accepted by `VSPipeNUTWriter::getVideoFourCC(...)`
 - Accepted families:
@@ -90,4 +100,3 @@ Header packet/footer layout follows the reference behavior:
 - No audio/subtitle muxing yet.
 - No alpha stream support yet.
 - No index writing or periodic header repetition yet.
-- No variable-frame-duration handling beyond fixed-FPS requirement.

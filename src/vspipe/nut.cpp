@@ -31,7 +31,10 @@ constexpr uint8_t kNutIdString[] = "nut/multimedia container";
 constexpr uint64_t kNutVersion = 3;
 constexpr uint64_t kMaxDistance = 32768;
 constexpr uint64_t kVideoClass = 0;
-constexpr uint64_t kStreamFlagsFixedFps = 1;
+constexpr uint64_t kStreamFlagsNone = 0;
+constexpr uint64_t kTimebaseNum = 1;
+constexpr uint64_t kTimebaseDen = 1000000;
+constexpr uint64_t kMaxPtsDistance = 1000000;
 constexpr uint64_t kFlagKey = 1;
 constexpr uint64_t kFlagCodedPts = 8;
 constexpr uint64_t kFlagStreamId = 16;
@@ -43,6 +46,7 @@ constexpr uint64_t kFlagInvalid = 8192;
 
 bool VSPipeNUTWriter::initialize(FILE *file, const VSVideoInfo *vi, std::string &errorMessage) {
     outFile = file;
+    lastSyncpointPosition = -1;
     std::array<uint8_t, 4> fourCC{};
     if (!getVideoFourCC(vi->format, fourCC)) {
         errorMessage = "Error: no supported NUT fourcc exists for current video format";
@@ -76,12 +80,25 @@ bool VSPipeNUTWriter::writeFrameHeader(int64_t pts, size_t frameSize, bool keyFr
     return writeBuffer(frameHeader, "NUT frame header", errorMessage);
 }
 
-bool VSPipeNUTWriter::writeSyncpoint(int64_t pts, std::string &errorMessage) const {
+bool VSPipeNUTWriter::writeSyncpoint(int64_t pts, std::string &errorMessage) {
+    long syncpointPos = std::ftell(outFile);
+    if (syncpointPos < 0) {
+        errorMessage = "Error: ftell() failed while preparing NUT syncpoint, errno: " + std::to_string(errno);
+        return false;
+    }
+
+    uint64_t backPtrDiv16 = 0;
+    if (lastSyncpointPosition >= 0 && syncpointPos > lastSyncpointPosition)
+        backPtrDiv16 = static_cast<uint64_t>(syncpointPos - lastSyncpointPosition) / 16;
+
     std::vector<uint8_t> payload;
     payload.reserve(16);
     appendV(payload, static_cast<uint64_t>(pts));
-    appendV(payload, 0);
-    return writePacket(kSyncpointStartcode, payload, errorMessage);
+    appendV(payload, backPtrDiv16);
+    if (!writePacket(kSyncpointStartcode, payload, errorMessage))
+        return false;
+    lastSyncpointPosition = syncpointPos;
+    return true;
 }
 
 bool VSPipeNUTWriter::getVideoFourCC(const VSVideoFormat &format, std::array<uint8_t, 4> &fourCC) {
@@ -148,20 +165,37 @@ bool VSPipeNUTWriter::getVideoFourCC(const VSVideoFormat &format, std::array<uin
     if (format.colorFamily == cfGray) {
         if (format.subSamplingW != 0 || format.subSamplingH != 0)
             return false;
+        if (bitsPerSample == 8) {
+            fourCC = { 'Y', '8', '0', '0' };
+            return true;
+        }
         fourCC = { 'Y', '1', 0, bitsPerSample };
         return true;
     }
 
     if (format.colorFamily == cfYUV) {
+        bool is420 = format.subSamplingW == 1 && format.subSamplingH == 1;
+        bool is422 = format.subSamplingW == 1 && format.subSamplingH == 0;
+        bool is444 = format.subSamplingW == 0 && format.subSamplingH == 0;
         uint8_t subSamplingCode = 0;
-        if (format.subSamplingW == 1 && format.subSamplingH == 1)
+        if (is420)
             subSamplingCode = 11;
-        else if (format.subSamplingW == 1 && format.subSamplingH == 0)
+        else if (is422)
             subSamplingCode = 10;
-        else if (format.subSamplingW == 0 && format.subSamplingH == 0)
+        else if (is444)
             subSamplingCode = 0;
         else
             return false;
+
+        if (bitsPerSample == 8) {
+            if (is420)
+                fourCC = { 'I', '4', '2', '0' };
+            else if (is422)
+                fourCC = { '4', '2', '2', 'P' };
+            else
+                fourCC = { '4', '4', '4', 'P' };
+            return true;
+        }
 
         fourCC = { 'Y', '3', subSamplingCode, bitsPerSample };
         return true;
@@ -267,8 +301,8 @@ bool VSPipeNUTWriter::writeMainHeader(const VSVideoInfo *vi, std::string &errorM
     appendV(payload, kMaxDistance);
 
     appendV(payload, 1);
-    appendV(payload, static_cast<uint64_t>(vi->fpsDen));
-    appendV(payload, static_cast<uint64_t>(vi->fpsNum));
+    appendV(payload, kTimebaseNum);
+    appendV(payload, kTimebaseDen);
 
     appendV(payload, kFlagInvalid);
     appendV(payload, 0);
@@ -303,9 +337,9 @@ bool VSPipeNUTWriter::writeStreamHeader(const VSVideoInfo *vi, const std::array<
     appendVB(payload, fourCC.data(), fourCC.size());
     appendV(payload, 0);
     appendV(payload, msbPtsShift);
-    appendV(payload, static_cast<uint64_t>((vi->fpsNum + vi->fpsDen - 1) / vi->fpsDen));
+    appendV(payload, kMaxPtsDistance);
     appendV(payload, 0);
-    appendV(payload, kStreamFlagsFixedFps);
+    appendV(payload, kStreamFlagsNone);
     appendV(payload, 0);
 
     appendV(payload, static_cast<uint64_t>(vi->width));
@@ -317,10 +351,6 @@ bool VSPipeNUTWriter::writeStreamHeader(const VSVideoInfo *vi, const std::array<
     return writePacket(kStreamStartcode, payload, errorMessage);
 }
 
-bool VSPipeNUTWriter::writeInitialSyncpoint(std::string &errorMessage) const {
-    std::vector<uint8_t> payload;
-    payload.reserve(16);
-    appendV(payload, 0);
-    appendV(payload, 0);
-    return writePacket(kSyncpointStartcode, payload, errorMessage);
+bool VSPipeNUTWriter::writeInitialSyncpoint(std::string &errorMessage) {
+    return writeSyncpoint(0, errorMessage);
 }

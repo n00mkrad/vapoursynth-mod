@@ -32,6 +32,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <charconv>
 #include <filesystem>
@@ -172,6 +173,10 @@ struct VSPipeOutputData {
     /* NUT output */
     std::unique_ptr<VSPipeNUTWriter> nutWriter;
     size_t nutFrameSize = 0;
+    int64_t nutCurrentPts = 0;
+    int64_t nutTimebaseNum = 1;
+    int64_t nutTimebaseDen = 1000000;
+    int64_t nutFallbackDurationTicks = 1;
 };
 
 /////////////////////////////////////////////
@@ -304,6 +309,37 @@ static std::string doubleToString(double v) {
     return std::string(buffer, res.ptr - buffer);
 }
 
+static int64_t convertDurationToNutTicks(int64_t durationNum, int64_t durationDen, const VSPipeOutputData *data) {
+    long double num = static_cast<long double>(durationNum) * static_cast<long double>(data->nutTimebaseDen);
+    long double den = static_cast<long double>(durationDen) * static_cast<long double>(data->nutTimebaseNum);
+    long double ticks = num / den;
+    return std::max<int64_t>(1, static_cast<int64_t>(ticks + 0.5L));
+}
+
+static int64_t getNutFramePts(const VSFrame *frame, VSPipeOutputData *data) {
+    int64_t pts = data->nutCurrentPts;
+    const VSMap *props = data->vsapi->getFramePropertiesRO(frame);
+    int err = 0;
+    double absoluteTime = data->vsapi->mapGetFloat(props, "_AbsoluteTime", 0, &err);
+    if (!err && absoluteTime >= 0.0) {
+        long double scaled = static_cast<long double>(absoluteTime) * static_cast<long double>(data->nutTimebaseDen) / static_cast<long double>(data->nutTimebaseNum);
+        pts = std::max<int64_t>(0, static_cast<int64_t>(scaled + 0.5L));
+    }
+    return pts;
+}
+
+static int64_t getNutFrameDurationTicks(const VSFrame *frame, VSPipeOutputData *data) {
+    int64_t durationTicks = data->nutFallbackDurationTicks;
+    const VSMap *props = data->vsapi->getFramePropertiesRO(frame);
+    int errNum = 0;
+    int errDen = 0;
+    int64_t durationNum = data->vsapi->mapGetInt(props, "_DurationNum", 0, &errNum);
+    int64_t durationDen = data->vsapi->mapGetInt(props, "_DurationDen", 0, &errDen);
+    if (!errNum && !errDen && durationNum > 0 && durationDen > 0)
+        durationTicks = convertDurationToNutTicks(durationNum, durationDen, data);
+    return std::max<int64_t>(1, durationTicks);
+}
+
 static void VS_CC frameDoneCallback(void *userData, const VSFrame *f, int n, VSNode *rnode, const char *errorMsg) {
     VSPipeOutputData *data = reinterpret_cast<VSPipeOutputData *>(userData);
 
@@ -366,10 +402,12 @@ static void VS_CC frameDoneCallback(void *userData, const VSFrame *f, int n, VSN
                         data->outputError = true;
                     }
                 } else if (data->outputHeaders == VSPipeHeaders::NUT && data->nutWriter) {
-                    if (!data->nutWriter->writeFrameHeader(data->outputFrames, data->nutFrameSize, true, data->errorMessage)) {
+                    int64_t framePts = getNutFramePts(frame, data);
+                    if (!data->nutWriter->writeFrameHeader(framePts, data->nutFrameSize, true, data->errorMessage)) {
                         data->totalFrames = data->requestedFrames;
                         data->outputError = true;
                     }
+                    data->nutCurrentPts = framePts + getNutFrameDurationTicks(frame, data);
                 }
 
                 outputFrame(frame, data);
@@ -535,10 +573,6 @@ static bool initializeVideoOutput(VSPipeOutputData *data) {
             fprintf(stderr, "Error: NUT output in v1 does not support alpha output\n");
             return false;
         }
-        if (vi->fpsNum <= 0 || vi->fpsDen <= 0) {
-            fprintf(stderr, "Error: NUT output in v1 requires a fixed and known fps\n");
-            return false;
-        }
         if (!VSPipeNUTWriter::getVideoFourCC(vi->format, fourCC)) {
             fprintf(stderr, "Error: no supported NUT fourcc exists for current video format\n");
             return false;
@@ -550,6 +584,10 @@ static bool initializeVideoOutput(VSPipeOutputData *data) {
             int height = vi->height >> ((p == 1 || p == 2) ? vi->format.subSamplingH : 0);
             data->nutFrameSize += static_cast<size_t>(width) * static_cast<size_t>(height) * vi->format.bytesPerSample;
         }
+        data->nutCurrentPts = 0;
+        data->nutFallbackDurationTicks = 1;
+        if (vi->fpsNum > 0 && vi->fpsDen > 0)
+            data->nutFallbackDurationTicks = convertDurationToNutTicks(vi->fpsDen, vi->fpsNum, data);
 
         data->nutWriter.reset(new VSPipeNUTWriter());
         if (!data->nutWriter->initialize(data->outFile, vi, data->errorMessage)) {
@@ -713,7 +751,7 @@ static void printHelp() {
         "  -o, --outputindex N              Select output index\n"
         "  -r, --requests N                 Set number of concurrent frame requests\n"
         "  -c, --container <y4m/nut/wav/w64> Add headers for the specified format to the output\n"
-        "                                   NUT currently supports RGB/YUV/Gray clips with fixed fps and no alpha output\n"
+        "                                   NUT currently supports RGB/YUV/Gray clips, including VFR via frame duration props, with no alpha output\n"
         "  -t, --timecodes FILE             Write timecodes v2 file\n"
         "  -j, --json FILE                  Write properties of output frames in json format to file\n"
         "  -p, --progress                   Print progress to stderr\n"

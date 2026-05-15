@@ -46,13 +46,14 @@ private:
 
     bool writeBuffer(const std::vector<uint8_t> &buffer, const char *context, std::string &errorMessage) const;
     bool writePacket(uint64_t startcode, const std::vector<uint8_t> &payload, std::string &errorMessage) const;
-    bool writeSyncpoint(int64_t pts, std::string &errorMessage) const;
+    bool writeSyncpoint(int64_t pts, std::string &errorMessage);
     bool writeMainHeader(const VSVideoInfo *vi, std::string &errorMessage) const;
     bool writeStreamHeader(const VSVideoInfo *vi, const std::array<uint8_t, 4> &fourCC, std::string &errorMessage) const;
-    bool writeInitialSyncpoint(std::string &errorMessage) const;
+    bool writeInitialSyncpoint(std::string &errorMessage);
 
     FILE *outFile = nullptr;
     int msbPtsShift = 8;
+    int64_t lastSyncpointPosition = -1;
 };
 
 #endif
