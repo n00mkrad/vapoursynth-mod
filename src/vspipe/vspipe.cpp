@@ -35,8 +35,10 @@
 #include <cmath>
 #include <chrono>
 #include <charconv>
+#include <cctype>
 #include <filesystem>
 #include <memory>
+#include <set>
 #include "../common/wave.h"
 #ifdef VS_TARGET_OS_WINDOWS
 #include <io.h>
@@ -108,6 +110,10 @@ struct VSPipeOptions {
     int64_t endPos = -1;
     int outputIndex = 0;
     int audioOutputIndex = -1;
+    std::vector<int> outputIndices;
+    std::vector<int> audioOutputIndices;
+    bool outputIndexExplicit = false;
+    bool audioOutputIndexExplicit = false;
     int requests = 0;
     bool printProgress = false;
     bool frameRefDebug = false;
@@ -312,34 +318,34 @@ static std::string doubleToString(double v) {
     return std::string(buffer, res.ptr - buffer);
 }
 
-static int64_t convertDurationToNutTicks(int64_t durationNum, int64_t durationDen, const VSPipeOutputData *data) {
-    long double num = static_cast<long double>(durationNum) * static_cast<long double>(data->nutTimebaseDen);
-    long double den = static_cast<long double>(durationDen) * static_cast<long double>(data->nutTimebaseNum);
+static int64_t convertDurationToNutTicks(int64_t durationNum, int64_t durationDen, int64_t timebaseNum, int64_t timebaseDen) {
+    long double num = static_cast<long double>(durationNum) * static_cast<long double>(timebaseDen);
+    long double den = static_cast<long double>(durationDen) * static_cast<long double>(timebaseNum);
     long double ticks = num / den;
     return std::max<int64_t>(1, static_cast<int64_t>(ticks + 0.5L));
 }
 
-static int64_t getNutFramePts(const VSFrame *frame, VSPipeOutputData *data) {
-    int64_t pts = data->nutCurrentPts;
-    const VSMap *props = data->vsapi->getFramePropertiesRO(frame);
+static int64_t getNutFramePts(const VSFrame *frame, const VSAPI *vsapi, int64_t fallbackPts, int64_t timebaseNum, int64_t timebaseDen) {
+    int64_t pts = fallbackPts;
+    const VSMap *props = vsapi->getFramePropertiesRO(frame);
     int err = 0;
-    double absoluteTime = data->vsapi->mapGetFloat(props, "_AbsoluteTime", 0, &err);
+    double absoluteTime = vsapi->mapGetFloat(props, "_AbsoluteTime", 0, &err);
     if (!err && absoluteTime >= 0.0) {
-        long double scaled = static_cast<long double>(absoluteTime) * static_cast<long double>(data->nutTimebaseDen) / static_cast<long double>(data->nutTimebaseNum);
+        long double scaled = static_cast<long double>(absoluteTime) * static_cast<long double>(timebaseDen) / static_cast<long double>(timebaseNum);
         pts = std::max<int64_t>(0, static_cast<int64_t>(scaled + 0.5L));
     }
     return pts;
 }
 
-static int64_t getNutFrameDurationTicks(const VSFrame *frame, VSPipeOutputData *data) {
-    int64_t durationTicks = data->nutFallbackDurationTicks;
-    const VSMap *props = data->vsapi->getFramePropertiesRO(frame);
+static int64_t getNutFrameDurationTicks(const VSFrame *frame, const VSAPI *vsapi, int64_t fallbackDurationTicks, int64_t timebaseNum, int64_t timebaseDen) {
+    int64_t durationTicks = fallbackDurationTicks;
+    const VSMap *props = vsapi->getFramePropertiesRO(frame);
     int errNum = 0;
     int errDen = 0;
-    int64_t durationNum = data->vsapi->mapGetInt(props, "_DurationNum", 0, &errNum);
-    int64_t durationDen = data->vsapi->mapGetInt(props, "_DurationDen", 0, &errDen);
+    int64_t durationNum = vsapi->mapGetInt(props, "_DurationNum", 0, &errNum);
+    int64_t durationDen = vsapi->mapGetInt(props, "_DurationDen", 0, &errDen);
     if (!errNum && !errDen && durationNum > 0 && durationDen > 0)
-        durationTicks = convertDurationToNutTicks(durationNum, durationDen, data);
+        durationTicks = convertDurationToNutTicks(durationNum, durationDen, timebaseNum, timebaseDen);
     return std::max<int64_t>(1, durationTicks);
 }
 
@@ -360,113 +366,156 @@ static size_t getNutAudioFrameSize(const VSFrame *frame, const VSAPI *vsapi) {
     return bytesPerOutputSample * numSamples * static_cast<size_t>(fi->numChannels);
 }
 
-static int64_t convertAudioSamplesToNutTicks(int64_t samples, int sampleRate, const VSPipeOutputData *data) {
-    long double num = static_cast<long double>(samples) * static_cast<long double>(data->nutTimebaseDen);
-    long double den = static_cast<long double>(sampleRate) * static_cast<long double>(data->nutTimebaseNum);
+static int64_t convertAudioSamplesToNutTicks(int64_t samples, int sampleRate, int64_t timebaseNum, int64_t timebaseDen) {
+    long double num = static_cast<long double>(samples) * static_cast<long double>(timebaseDen);
+    long double den = static_cast<long double>(sampleRate) * static_cast<long double>(timebaseNum);
     long double ticks = num / den;
     return std::max<int64_t>(0, static_cast<int64_t>(ticks + 0.5L));
 }
 
-static bool shouldOutputVideoBeforeAudio(int64_t videoPts, int64_t audioSamplesWritten, int sampleRate, const VSPipeOutputData *data) {
-    int64_t audioPts = convertAudioSamplesToNutTicks(audioSamplesWritten, sampleRate, data);
-    return videoPts <= audioPts;
+struct VSPipeNUTMuxStreamContext {
+    VSNode *node = nullptr;
+    int selectedIndex = -1;
+    int streamId = -1;
+    bool isVideo = false;
+    const VSVideoInfo *videoInfo = nullptr;
+    const VSAudioInfo *audioInfo = nullptr;
+    size_t videoFrameSize = 0;
+    int frameIndex = 0;
+    int framesWritten = 0;
+    int64_t audioSamplesWritten = 0;
+    int64_t videoCurrentPts = 0;
+    int64_t videoFallbackDurationTicks = 1;
+    const VSFrame *pendingFrame = nullptr;
+    int64_t pendingPts = 0;
+};
+
+static bool fetchNutStreamFrame(VSPipeNUTMuxStreamContext &stream, VSPipeOutputData *data) {
+    int maxFrames = stream.isVideo ? stream.videoInfo->numFrames : stream.audioInfo->numFrames;
+    if (stream.frameIndex >= maxFrames)
+        return true;
+
+    std::array<char, 1024> errorBuffer{};
+    stream.pendingFrame = data->vsapi->getFrame(stream.frameIndex, stream.node, errorBuffer.data(), static_cast<int>(errorBuffer.size()));
+    if (!stream.pendingFrame) {
+        if (!errorBuffer[0])
+            data->errorMessage = "Error: failed to retrieve frame " + std::to_string(stream.frameIndex) + " from selected output index " + std::to_string(stream.selectedIndex);
+        else
+            data->errorMessage = "Error: failed to retrieve frame " + std::to_string(stream.frameIndex) + " from selected output index " + std::to_string(stream.selectedIndex) + " with error: " + errorBuffer.data();
+        data->outputError = true;
+        return false;
+    }
+
+    if (stream.isVideo) {
+        stream.pendingPts = getNutFramePts(stream.pendingFrame, data->vsapi, stream.videoCurrentPts, data->nutTimebaseNum, data->nutTimebaseDen);
+    } else {
+        stream.pendingPts = convertAudioSamplesToNutTicks(stream.audioSamplesWritten, stream.audioInfo->sampleRate, data->nutTimebaseNum, data->nutTimebaseDen);
+    }
+
+    return true;
 }
 
-static bool outputNutAudioVideoNode(const VSPipeOptions &opts, VSPipeOutputData *data) {
-    const VSVideoInfo *vi = data->vsapi->getVideoInfo(data->node);
-    const VSAudioInfo *ai = data->vsapi->getAudioInfo(data->audioNode);
-    const VSFrame *videoFrame = nullptr;
-    const VSFrame *audioFrame = nullptr;
-    int videoFrameIndex = 0;
-    int audioFrameIndex = 0;
-    int videoFramesWritten = 0;
-    int audioFramesWritten = 0;
-    data->nutAudioSamplesWritten = 0;
+static int selectNextNutStream(const std::vector<VSPipeNUTMuxStreamContext> &streams) {
+    int selected = -1;
+
+    for (size_t i = 0; i < streams.size(); i++) {
+        if (!streams[i].pendingFrame)
+            continue;
+
+        if (selected < 0) {
+            selected = static_cast<int>(i);
+            continue;
+        }
+
+        if (streams[i].pendingPts < streams[selected].pendingPts || (streams[i].pendingPts == streams[selected].pendingPts && streams[i].streamId < streams[selected].streamId))
+            selected = static_cast<int>(i);
+    }
+
+    return selected;
+}
+
+static bool outputNutStreamsNode(const VSPipeOptions &opts, VSPipeOutputData *data, std::vector<VSPipeNUTMuxStreamContext> &streams, int64_t totalVideoFramesExpected, int64_t totalAudioSamplesExpected) {
     data->outputFrames = 0;
     data->startTime = std::chrono::steady_clock::now();
     data->lastFPSReportTime = std::chrono::steady_clock::now();
 
-    auto fetchFrameSync = [&](int n, VSNode *node, const char *label, const VSFrame **dst) -> bool {
-        std::array<char, 1024> errorBuffer{};
-        *dst = data->vsapi->getFrame(n, node, errorBuffer.data(), static_cast<int>(errorBuffer.size()));
-        if (!*dst) {
-            if (!errorBuffer[0])
-                data->errorMessage = std::string("Error: failed to retrieve ") + label + " frame " + std::to_string(n);
-            else
-                data->errorMessage = std::string("Error: failed to retrieve ") + label + " frame " + std::to_string(n) + " with error: " + errorBuffer.data();
+    for (auto &stream : streams) {
+        if (!fetchNutStreamFrame(stream, data))
+            break;
+    }
+
+    while (!data->outputError) {
+        int nextStreamIndex = selectNextNutStream(streams);
+        if (nextStreamIndex < 0)
+            break;
+
+        VSPipeNUTMuxStreamContext &stream = streams[nextStreamIndex];
+        size_t frameSize = stream.isVideo ? stream.videoFrameSize : getNutAudioFrameSize(stream.pendingFrame, data->vsapi);
+
+        if (!data->nutWriter->writeFrameHeader(stream.streamId, stream.pendingPts, frameSize, true, data->errorMessage)) {
             data->outputError = true;
-            return false;
+            break;
         }
-        return true;
-    };
 
-    if (videoFrameIndex < vi->numFrames && !fetchFrameSync(videoFrameIndex, data->node, "video", &videoFrame))
-        return true;
-    if (audioFrameIndex < ai->numFrames && !fetchFrameSync(audioFrameIndex, data->audioNode, "audio", &audioFrame))
-        return true;
+        outputFrame(stream.pendingFrame, data);
+        if (data->outputError)
+            break;
 
-    while ((videoFrame || audioFrame) && !data->outputError) {
-        bool writeVideoPacket = false;
-        if (videoFrame && !audioFrame)
-            writeVideoPacket = true;
-        else if (videoFrame && audioFrame)
-            writeVideoPacket = shouldOutputVideoBeforeAudio(getNutFramePts(videoFrame, data), data->nutAudioSamplesWritten, ai->sampleRate, data);
-
-        if (writeVideoPacket) {
-            int64_t framePts = getNutFramePts(videoFrame, data);
-            data->outputFrames = videoFramesWritten + audioFramesWritten;
-            if (!data->nutWriter->writeFrameHeader(0, framePts, data->nutFrameSize, true, data->errorMessage)) {
-                data->outputError = true;
-                break;
-            }
-            outputFrame(videoFrame, data);
-            data->nutCurrentPts = framePts + getNutFrameDurationTicks(videoFrame, data);
-
-            data->vsapi->freeFrame(videoFrame);
-            videoFrame = nullptr;
-            videoFrameIndex++;
-            videoFramesWritten++;
-            if (videoFrameIndex < vi->numFrames && !fetchFrameSync(videoFrameIndex, data->node, "video", &videoFrame))
-                break;
+        if (stream.isVideo) {
+            stream.videoCurrentPts = stream.pendingPts + getNutFrameDurationTicks(stream.pendingFrame, data->vsapi, stream.videoFallbackDurationTicks, data->nutTimebaseNum, data->nutTimebaseDen);
         } else {
-            int64_t framePts = convertAudioSamplesToNutTicks(data->nutAudioSamplesWritten, ai->sampleRate, data);
-            size_t frameSize = getNutAudioFrameSize(audioFrame, data->vsapi);
-            data->outputFrames = videoFramesWritten + audioFramesWritten;
-            if (!data->nutWriter->writeFrameHeader(1, framePts, frameSize, true, data->errorMessage)) {
-                data->outputError = true;
-                break;
-            }
-            outputFrame(audioFrame, data);
-            data->nutAudioSamplesWritten += data->vsapi->getFrameLength(audioFrame);
-
-            data->vsapi->freeFrame(audioFrame);
-            audioFrame = nullptr;
-            audioFrameIndex++;
-            audioFramesWritten++;
-            if (audioFrameIndex < ai->numFrames && !fetchFrameSync(audioFrameIndex, data->audioNode, "audio", &audioFrame))
-                break;
+            stream.audioSamplesWritten += data->vsapi->getFrameLength(stream.pendingFrame);
         }
+
+        data->vsapi->freeFrame(stream.pendingFrame);
+        stream.pendingFrame = nullptr;
+        stream.frameIndex++;
+        stream.framesWritten++;
+        data->outputFrames++;
+
+        if (!fetchNutStreamFrame(stream, data))
+            break;
 
         if (opts.printProgress) {
             std::chrono::time_point<std::chrono::steady_clock> currentTime(std::chrono::steady_clock::now());
             std::chrono::duration<double> elapsedSeconds = currentTime - data->lastFPSReportTime;
             if (elapsedSeconds.count() > .5) {
+                int64_t videoFramesWritten = 0;
+                int64_t audioSamplesWritten = 0;
+                for (const auto &iter : streams) {
+                    if (iter.isVideo)
+                        videoFramesWritten += iter.framesWritten;
+                    else
+                        audioSamplesWritten += iter.audioSamplesWritten;
+                }
                 data->lastFPSReportTime = currentTime;
-                fprintf(stderr, "Video frame: %d/%d Audio sample: %" PRId64 "/%" PRId64 "\r", videoFramesWritten, vi->numFrames, data->nutAudioSamplesWritten, ai->numSamples);
+                fprintf(stderr, "Video frame: %" PRId64 "/%" PRId64 " Audio sample: %" PRId64 "/%" PRId64 "\r", videoFramesWritten, totalVideoFramesExpected, audioSamplesWritten, totalAudioSamplesExpected);
             }
         }
     }
 
-    if (videoFrame)
-        data->vsapi->freeFrame(videoFrame);
-    if (audioFrame)
-        data->vsapi->freeFrame(audioFrame);
+    for (auto &stream : streams) {
+        if (stream.pendingFrame) {
+            data->vsapi->freeFrame(stream.pendingFrame);
+            stream.pendingFrame = nullptr;
+        }
+    }
 
     if (data->outputError && !data->errorMessage.empty())
         fprintf(stderr, "%s\n", data->errorMessage.c_str());
 
-    data->totalFrames = videoFramesWritten;
-    data->totalSamples = data->nutAudioSamplesWritten;
+    int64_t totalVideoFramesWritten = 0;
+    int64_t totalAudioSamplesWritten = 0;
+    for (const auto &stream : streams) {
+        if (stream.isVideo)
+            totalVideoFramesWritten += stream.framesWritten;
+        else
+            totalAudioSamplesWritten += stream.audioSamplesWritten;
+    }
+
+    data->totalFrames = static_cast<int>(totalVideoFramesWritten);
+    data->totalSamples = totalAudioSamplesWritten;
+
     return data->outputError;
 }
 
@@ -533,14 +582,14 @@ static void VS_CC frameDoneCallback(void *userData, const VSFrame *f, int n, VSN
                     }
                 } else if (data->outputHeaders == VSPipeHeaders::NUT && data->nutWriter) {
                     if (data->vsapi->getFrameType(frame) == mtVideo) {
-                        int64_t framePts = getNutFramePts(frame, data);
+                        int64_t framePts = getNutFramePts(frame, data->vsapi, data->nutCurrentPts, data->nutTimebaseNum, data->nutTimebaseDen);
                         if (!data->nutWriter->writeFrameHeader(0, framePts, data->nutFrameSize, true, data->errorMessage)) {
                             data->totalFrames = data->requestedFrames;
                             data->outputError = true;
                         }
-                        data->nutCurrentPts = framePts + getNutFrameDurationTicks(frame, data);
+                        data->nutCurrentPts = framePts + getNutFrameDurationTicks(frame, data->vsapi, data->nutFallbackDurationTicks, data->nutTimebaseNum, data->nutTimebaseDen);
                     } else if (data->vsapi->getFrameType(frame) == mtAudio) {
-                        int64_t framePts = convertAudioSamplesToNutTicks(data->nutAudioSamplesWritten, data->vsapi->getAudioInfo(data->node)->sampleRate, data);
+                        int64_t framePts = convertAudioSamplesToNutTicks(data->nutAudioSamplesWritten, data->vsapi->getAudioInfo(data->node)->sampleRate, data->nutTimebaseNum, data->nutTimebaseDen);
                         size_t frameSize = getNutAudioFrameSize(frame, data->vsapi);
                         if (!data->nutWriter->writeFrameHeader(0, framePts, frameSize, true, data->errorMessage)) {
                             data->totalFrames = data->requestedFrames;
@@ -710,10 +759,6 @@ static bool initializeVideoOutput(VSPipeOutputData *data) {
         }
     } else if (data->outputHeaders == VSPipeHeaders::NUT) {
         std::array<uint8_t, 4> fourCC{};
-        if (data->alphaNode) {
-            fprintf(stderr, "Error: NUT output in v1 does not support alpha output\n");
-            return false;
-        }
         if (!VSPipeNUTWriter::getVideoFourCC(vi->format, fourCC)) {
             fprintf(stderr, "Error: no supported NUT fourcc exists for current video format\n");
             return false;
@@ -723,7 +768,7 @@ static bool initializeVideoOutput(VSPipeOutputData *data) {
         data->nutCurrentPts = 0;
         data->nutFallbackDurationTicks = 1;
         if (vi->fpsNum > 0 && vi->fpsDen > 0)
-            data->nutFallbackDurationTicks = convertDurationToNutTicks(vi->fpsDen, vi->fpsNum, data);
+            data->nutFallbackDurationTicks = convertDurationToNutTicks(vi->fpsDen, vi->fpsNum, data->nutTimebaseNum, data->nutTimebaseDen);
 
         data->nutWriter.reset(new VSPipeNUTWriter());
         VSPipeNUTStreamInfo streamInfo;
@@ -895,6 +940,46 @@ static bool svToInt(const std::string_view &s, int &result) {
     return (res.ptr == s.data() + s.size());
 }
 
+static std::string_view trimStringView(const std::string_view &s) {
+    size_t start = 0;
+    size_t end = s.size();
+
+    while (start < end && std::isspace(static_cast<unsigned char>(s[start])))
+        start++;
+    while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1])))
+        end--;
+
+    return s.substr(start, end - start);
+}
+
+static bool svToIntList(const std::string_view &s, std::vector<int> &result) {
+    result.clear();
+
+    if (s.empty())
+        return false;
+
+    size_t start = 0;
+    while (start <= s.size()) {
+        size_t commaPos = s.find(',', start);
+        size_t tokenEnd = (commaPos == std::string_view::npos) ? s.size() : commaPos;
+        std::string_view token = trimStringView(s.substr(start, tokenEnd - start));
+
+        if (token.empty())
+            return false;
+
+        int value = 0;
+        if (!svToInt(token, value) || value < 0)
+            return false;
+        result.push_back(value);
+
+        if (commaPos == std::string_view::npos)
+            break;
+        start = commaPos + 1;
+    }
+
+    return !result.empty();
+}
+
 static bool printVersion(const VSAPI *vsapi) {
     VSCore *core = vsapi->createCore(0);
     if (!core) {
@@ -918,8 +1003,8 @@ static void printHelp() {
         "  -a, --arg key=value               Argument to pass to the script environment\n"
         "  -s, --start N                     Set output frame/sample range start\n"
         "  -e, --end N                       Set output frame/sample range end (inclusive)\n"
-        "  -o, --outputindex N               Select output index\n"
-        "  -u, --audio-outputindex N         Select secondary audio output index for NUT muxing\n"
+        "  -o, --outputindex N[,M,...]       Select output index or comma-separated output indices\n"
+        "  -u, --audio-outputindex N[,M,...] Select secondary audio output index or comma-separated audio indices for NUT muxing\n"
         "  -r, --requests N                  Set number of concurrent frame requests\n"
         "  -c, --container <y4m/nut/wav/w64> Add headers for the specified format to the output (use nut to carry multiple streams)\n"
         "  -t, --timecodes FILE              Write timecodes v2 file\n"
@@ -1081,10 +1166,14 @@ static int parseOptions(VSPipeOptions &opts, int argc, char **argv) {
                 return 1;
             }
 
-            if (!svToInt(argv[arg + 1], opts.outputIndex)) {
-                fprintf(stderr, "Couldn't convert %s to an integer (index)\n", argv[arg + 1]);
+            std::vector<int> parsedIndices;
+            if (!svToIntList(argv[arg + 1], parsedIndices)) {
+                fprintf(stderr, "Couldn't parse %s as a comma-separated index list\n", argv[arg + 1]);
                 return 1;
             }
+            opts.outputIndices = std::move(parsedIndices);
+            opts.outputIndex = opts.outputIndices.front();
+            opts.outputIndexExplicit = true;
 
             arg++;
         } else if (argString == "-u" || argString == "--audio-outputindex") {
@@ -1093,14 +1182,14 @@ static int parseOptions(VSPipeOptions &opts, int argc, char **argv) {
                 return 1;
             }
 
-            if (!svToInt(argv[arg + 1], opts.audioOutputIndex)) {
-                fprintf(stderr, "Couldn't convert %s to an integer (audio index)\n", argv[arg + 1]);
+            std::vector<int> parsedIndices;
+            if (!svToIntList(argv[arg + 1], parsedIndices)) {
+                fprintf(stderr, "Couldn't parse %s as a comma-separated audio index list\n", argv[arg + 1]);
                 return 1;
             }
-            if (opts.audioOutputIndex < 0) {
-                fprintf(stderr, "Negative audio output index specified\n");
-                return 1;
-            }
+            opts.audioOutputIndices = std::move(parsedIndices);
+            opts.audioOutputIndex = opts.audioOutputIndices.front();
+            opts.audioOutputIndexExplicit = true;
 
             arg++;
         } else if (argString == "-r" || argString == "--requests") {
@@ -1171,6 +1260,9 @@ static int parseOptions(VSPipeOptions &opts, int argc, char **argv) {
         return 1;
     }
 
+    if (!opts.outputIndexExplicit)
+        opts.outputIndices.push_back(opts.outputIndex);
+
     return 0;
 }
 
@@ -1229,7 +1321,7 @@ int main(int argc, char **argv) {
     int parseResult = parseOptions(opts, argc, argv);
     if (parseResult)
         return parseResult;
-    if (opts.mode == VSPipeMode::Output && opts.audioOutputIndex >= 0 && opts.outputHeaders != VSPipeHeaders::NUT) {
+    if (opts.mode == VSPipeMode::Output && !opts.audioOutputIndices.empty() && opts.outputHeaders != VSPipeHeaders::NUT) {
         fprintf(stderr, "Error: --audio-outputindex can only be used together with -c nut\n");
         return 1;
     }
@@ -1422,78 +1514,56 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    VSNode *node = vssapi->getOutputNode(se, opts.outputIndex);
-    if (!node) {
-       fprintf(stderr, "Failed to retrieve output node. Invalid index specified?\n");
-       vssapi->freeScript(se);
-       return 1;
+    std::vector<int> selectedVideoIndices = opts.outputIndices;
+    std::vector<int> selectedAudioIndices = opts.audioOutputIndices;
+    bool nutOutputMode = opts.mode == VSPipeMode::Output && opts.outputHeaders == VSPipeHeaders::NUT;
+    if (nutOutputMode && !opts.outputIndexExplicit && !selectedAudioIndices.empty())
+        selectedVideoIndices.clear();
+
+    int primaryOutputIndex = opts.outputIndex;
+    if (nutOutputMode) {
+        if (!selectedVideoIndices.empty())
+            primaryOutputIndex = selectedVideoIndices.front();
+        else if (!selectedAudioIndices.empty())
+            primaryOutputIndex = selectedAudioIndices.front();
     }
 
-    VSNode *alphaNode = vssapi->getOutputAlphaNode(se, opts.outputIndex);
+    VSNode *node = vssapi->getOutputNode(se, primaryOutputIndex);
+    if (!node) {
+        fprintf(stderr, "Failed to retrieve output node. Invalid index specified?\n");
+        vssapi->freeScript(se);
+        return 1;
+    }
+
+    VSNode *alphaNode = vssapi->getOutputAlphaNode(se, primaryOutputIndex);
     VSNode *audioNode = nullptr;
-    bool nutAudioVideoMode = opts.outputHeaders == VSPipeHeaders::NUT && opts.audioOutputIndex >= 0;
+    std::vector<VSNode *> nutExtraNodes;
+    bool nutMultiStreamMode = nutOutputMode && (selectedVideoIndices.size() + selectedAudioIndices.size() > 1);
 
-    if (nutAudioVideoMode) {
-        if (opts.outputIndex == opts.audioOutputIndex) {
-            fprintf(stderr, "Error: --audio-outputindex must be different from --outputindex\n");
-            vsapi->freeNode(node);
-            vsapi->freeNode(alphaNode);
-            vssapi->freeScript(se);
-            return 1;
-        }
-        if (opts.startPos != 0 || opts.endPos != -1) {
-            fprintf(stderr, "Error: --start/--end are not supported in NUT video+audio mode, trim in script instead\n");
-            vsapi->freeNode(node);
-            vsapi->freeNode(alphaNode);
-            vssapi->freeScript(se);
-            return 1;
-        }
-        if (alphaNode) {
-            fprintf(stderr, "Error: NUT video+audio mode does not support alpha output\n");
-            vsapi->freeNode(node);
-            vsapi->freeNode(alphaNode);
-            vssapi->freeScript(se);
-            return 1;
-        }
-        if (opts.mode == VSPipeMode::Output && (!opts.timecodesFilename.empty() || !opts.jsonFilename.empty())) {
-            fprintf(stderr, "Error: --timecodes and --json are not supported in NUT video+audio mode\n");
-            vsapi->freeNode(node);
-            vsapi->freeNode(alphaNode);
-            vssapi->freeScript(se);
-            return 1;
-        }
-        if (vsapi->getNodeType(node) != mtVideo) {
-            fprintf(stderr, "Error: --outputindex must reference a video output for NUT video+audio mode\n");
-            vsapi->freeNode(node);
-            vsapi->freeNode(alphaNode);
-            vssapi->freeScript(se);
-            return 1;
-        }
+    if (nutMultiStreamMode && (opts.startPos != 0 || opts.endPos != -1)) {
+        fprintf(stderr, "Error: --start/--end are not supported in NUT multi-stream mode, trim in script instead\n");
+        vsapi->freeNode(node);
+        vsapi->freeNode(alphaNode);
+        vssapi->freeScript(se);
+        return 1;
+    }
+    if (nutMultiStreamMode && (!opts.timecodesFilename.empty() || !opts.jsonFilename.empty())) {
+        fprintf(stderr, "Error: --timecodes and --json are not supported in NUT multi-stream mode\n");
+        vsapi->freeNode(node);
+        vsapi->freeNode(alphaNode);
+        vssapi->freeScript(se);
+        return 1;
+    }
 
-        audioNode = vssapi->getOutputNode(se, opts.audioOutputIndex);
-        if (!audioNode) {
-            fprintf(stderr, "Error: failed to retrieve audio output node. Invalid --audio-outputindex specified?\n");
-            vsapi->freeNode(node);
-            vsapi->freeNode(alphaNode);
-            vssapi->freeScript(se);
-            return 1;
-        }
-        if (vsapi->getNodeType(audioNode) != mtAudio) {
-            fprintf(stderr, "Error: --audio-outputindex must reference an audio output for NUT video+audio mode\n");
-            vsapi->freeNode(node);
-            vsapi->freeNode(alphaNode);
-            vsapi->freeNode(audioNode);
-            vssapi->freeScript(se);
-            return 1;
-        }
+    if (nutOutputMode && alphaNode) {
+        vsapi->freeNode(alphaNode);
+        alphaNode = nullptr;
     }
 
     // disable cache since no frame is ever requested twice
     vsapi->setCacheMode(node, cmForceDisable);
     if (alphaNode)
         vsapi->setCacheMode(alphaNode, cmForceDisable);
-    if (audioNode)
-        vsapi->setCacheMode(audioNode, cmForceDisable);
 
     bool success = true;
 
@@ -1515,7 +1585,7 @@ int main(int argc, char **argv) {
 
         int nodeType = vsapi->getNodeType(node);
 
-        if (!nutAudioVideoMode && (opts.startPos != 0 || opts.endPos != -1)) {
+        if (!(nutOutputMode && nutMultiStreamMode) && (opts.startPos != 0 || opts.endPos != -1)) {
             VSMap *args = vsapi->createMap();
             vsapi->mapSetNode(args, "clip", node, maAppend);
             if (opts.startPos != 0)
@@ -1572,84 +1642,210 @@ int main(int argc, char **argv) {
         data->timecodesFile = timecodesFile;
         data->jsonFile = jsonFile;
 
-        if (nutAudioVideoMode) {
-            const VSVideoInfo *vi = vsapi->getVideoInfo(node);
-            const VSAudioInfo *ai = vsapi->getAudioInfo(audioNode);
-            std::array<uint8_t, 4> videoFourCC{};
-            std::array<uint8_t, 4> audioFourCC{};
+        if (nutOutputMode) {
+            data->alphaNode = nullptr;
+            data->audioNode = nullptr;
 
-            if (!isConstantVideoFormat(vi)) {
-                fprintf(stderr, "Cannot output clips with varying dimensions\n");
-                vsapi->freeNode(node);
-                vsapi->freeNode(alphaNode);
-                vsapi->freeNode(audioNode);
-                vssapi->freeScript(se);
-                return 1;
+            std::set<int> usedIndices;
+            bool hasDuplicate = false;
+            for (const auto &idx : selectedVideoIndices) {
+                if (!usedIndices.insert(idx).second) {
+                    hasDuplicate = true;
+                    break;
+                }
             }
-            if (!VSPipeNUTWriter::getVideoFourCC(vi->format, videoFourCC)) {
-                fprintf(stderr, "Error: no supported NUT fourcc exists for current video format\n");
-                vsapi->freeNode(node);
-                vsapi->freeNode(alphaNode);
-                vsapi->freeNode(audioNode);
-                vssapi->freeScript(se);
-                return 1;
+            for (const auto &idx : selectedAudioIndices) {
+                if (!usedIndices.insert(idx).second) {
+                    hasDuplicate = true;
+                    break;
+                }
             }
-            if (!VSPipeNUTWriter::getAudioFourCC(ai->format, audioFourCC)) {
-                fprintf(stderr, "Error: no supported NUT fourcc exists for current audio format\n");
-                vsapi->freeNode(node);
-                vsapi->freeNode(alphaNode);
-                vsapi->freeNode(audioNode);
-                vssapi->freeScript(se);
-                return 1;
-            }
-            if (ai->sampleRate <= 0) {
-                fprintf(stderr, "Error: NUT output requires a positive audio sample rate\n");
-                vsapi->freeNode(node);
-                vsapi->freeNode(alphaNode);
-                vsapi->freeNode(audioNode);
-                vssapi->freeScript(se);
-                return 1;
-            }
-
-            data->nutFrameSize = getNutVideoFrameSize(vi);
-            data->nutCurrentPts = 0;
-            data->nutFallbackDurationTicks = 1;
-            if (vi->fpsNum > 0 && vi->fpsDen > 0)
-                data->nutFallbackDurationTicks = convertDurationToNutTicks(vi->fpsDen, vi->fpsNum, data.get());
-
-            data->nutWriter.reset(new VSPipeNUTWriter());
-            VSPipeNUTStreamInfo videoStreamInfo;
-            videoStreamInfo.type = VSPipeNUTStreamType::Video;
-            videoStreamInfo.fourCC = videoFourCC;
-            videoStreamInfo.width = vi->width;
-            videoStreamInfo.height = vi->height;
-
-            VSPipeNUTStreamInfo audioStreamInfo;
-            audioStreamInfo.type = VSPipeNUTStreamType::Audio;
-            audioStreamInfo.fourCC = audioFourCC;
-            audioStreamInfo.sampleRateNum = ai->sampleRate;
-            audioStreamInfo.sampleRateDen = 1;
-            audioStreamInfo.channelCount = ai->format.numChannels;
-
-            std::vector<VSPipeNUTStreamInfo> streams;
-            streams.push_back(videoStreamInfo);
-            streams.push_back(audioStreamInfo);
-
-            if (!data->nutWriter->initialize(data->outFile, streams, data->errorMessage)) {
-                if (!data->errorMessage.empty())
-                    fprintf(stderr, "%s\n", data->errorMessage.c_str());
-                else
-                    fprintf(stderr, "Error: failed to initialize NUT output\n");
+            if (hasDuplicate) {
+                fprintf(stderr, "Error: duplicate output indices are not allowed in NUT stream selection\n");
                 success = false;
             }
 
+            std::map<int, VSNode *> selectedNodes;
+            selectedNodes[primaryOutputIndex] = node;
+
+            auto getSelectedNode = [&](int selectedIndex, VSNode *&selectedNode) -> bool {
+                auto found = selectedNodes.find(selectedIndex);
+                if (found != selectedNodes.end()) {
+                    selectedNode = found->second;
+                    return true;
+                }
+
+                selectedNode = vssapi->getOutputNode(se, selectedIndex);
+                if (!selectedNode) {
+                    data->errorMessage = "Error: failed to retrieve output node for selected index " + std::to_string(selectedIndex);
+                    data->outputError = true;
+                    return false;
+                }
+
+                vsapi->setCacheMode(selectedNode, cmForceDisable);
+                selectedNodes[selectedIndex] = selectedNode;
+                nutExtraNodes.push_back(selectedNode);
+                return true;
+            };
+
+            std::vector<VSPipeNUTMuxStreamContext> streamContexts;
+            std::vector<VSPipeNUTStreamInfo> streamInfos;
+            streamContexts.reserve(selectedVideoIndices.size() + selectedAudioIndices.size());
+            streamInfos.reserve(selectedVideoIndices.size() + selectedAudioIndices.size());
+
+            int streamId = 0;
+            auto appendStream = [&](int selectedIndex, bool fromVideoList) -> bool {
+                VSNode *selectedNode = nullptr;
+                if (!getSelectedNode(selectedIndex, selectedNode))
+                    return false;
+
+                int selectedNodeType = vsapi->getNodeType(selectedNode);
+                bool allowLegacyAudioOnPrimaryList = !nutMultiStreamMode && selectedAudioIndices.empty() && selectedVideoIndices.size() == 1;
+
+                if (fromVideoList) {
+                    if (selectedNodeType != mtVideo && !(allowLegacyAudioOnPrimaryList && selectedNodeType == mtAudio)) {
+                        data->errorMessage = "Error: --outputindex entry " + std::to_string(selectedIndex) + " is not a video output";
+                        data->outputError = true;
+                        return false;
+                    }
+                } else {
+                    if (selectedNodeType != mtAudio) {
+                        data->errorMessage = "Error: --audio-outputindex entry " + std::to_string(selectedIndex) + " is not an audio output";
+                        data->outputError = true;
+                        return false;
+                    }
+                }
+
+                if (selectedNodeType == mtVideo) {
+                    const VSVideoInfo *vi = vsapi->getVideoInfo(selectedNode);
+                    std::array<uint8_t, 4> fourCC{};
+
+                    if (!isConstantVideoFormat(vi)) {
+                        data->errorMessage = "Error: output index " + std::to_string(selectedIndex) + " has varying dimensions";
+                        data->outputError = true;
+                        return false;
+                    }
+                    if (!VSPipeNUTWriter::getVideoFourCC(vi->format, fourCC)) {
+                        data->errorMessage = "Error: no supported NUT fourcc exists for video output index " + std::to_string(selectedIndex);
+                        data->outputError = true;
+                        return false;
+                    }
+
+                    VSPipeNUTStreamInfo streamInfo;
+                    streamInfo.type = VSPipeNUTStreamType::Video;
+                    streamInfo.fourCC = fourCC;
+                    streamInfo.width = vi->width;
+                    streamInfo.height = vi->height;
+                    streamInfos.push_back(streamInfo);
+
+                    VSPipeNUTMuxStreamContext context;
+                    context.node = selectedNode;
+                    context.selectedIndex = selectedIndex;
+                    context.streamId = streamId++;
+                    context.isVideo = true;
+                    context.videoInfo = vi;
+                    context.videoFrameSize = getNutVideoFrameSize(vi);
+                    context.videoCurrentPts = 0;
+                    context.videoFallbackDurationTicks = 1;
+                    if (vi->fpsNum > 0 && vi->fpsDen > 0)
+                        context.videoFallbackDurationTicks = convertDurationToNutTicks(vi->fpsDen, vi->fpsNum, data->nutTimebaseNum, data->nutTimebaseDen);
+                    streamContexts.push_back(context);
+                } else {
+                    const VSAudioInfo *ai = vsapi->getAudioInfo(selectedNode);
+                    std::array<uint8_t, 4> fourCC{};
+
+                    if (!VSPipeNUTWriter::getAudioFourCC(ai->format, fourCC)) {
+                        data->errorMessage = "Error: no supported NUT fourcc exists for audio output index " + std::to_string(selectedIndex);
+                        data->outputError = true;
+                        return false;
+                    }
+                    if (ai->sampleRate <= 0) {
+                        data->errorMessage = "Error: audio output index " + std::to_string(selectedIndex) + " has a non-positive sample rate";
+                        data->outputError = true;
+                        return false;
+                    }
+                    if (ai->format.numChannels <= 0) {
+                        data->errorMessage = "Error: audio output index " + std::to_string(selectedIndex) + " has no channels";
+                        data->outputError = true;
+                        return false;
+                    }
+
+                    VSPipeNUTStreamInfo streamInfo;
+                    streamInfo.type = VSPipeNUTStreamType::Audio;
+                    streamInfo.fourCC = fourCC;
+                    streamInfo.sampleRateNum = ai->sampleRate;
+                    streamInfo.sampleRateDen = 1;
+                    streamInfo.channelCount = ai->format.numChannels;
+                    streamInfos.push_back(streamInfo);
+
+                    VSPipeNUTMuxStreamContext context;
+                    context.node = selectedNode;
+                    context.selectedIndex = selectedIndex;
+                    context.streamId = streamId++;
+                    context.isVideo = false;
+                    context.audioInfo = ai;
+                    streamContexts.push_back(context);
+                }
+
+                return true;
+            };
+
             if (success) {
-                size_t videoBufferSize = static_cast<size_t>(vi->width) * static_cast<size_t>(vi->height) * static_cast<size_t>(vi->format.bytesPerSample);
-                size_t audioBufferSize = static_cast<size_t>(ai->format.numChannels) * static_cast<size_t>(VS_AUDIO_FRAME_SAMPLES) * static_cast<size_t>(ai->format.bytesPerSample);
-                data->buffer.resize(std::max(videoBufferSize, audioBufferSize));
-                data->totalFrames = vi->numFrames;
-                data->totalSamples = ai->numSamples;
-                success = !outputNutAudioVideoNode(opts, data.get());
+                for (const auto &selectedIndex : selectedVideoIndices) {
+                    if (!appendStream(selectedIndex, true)) {
+                        success = false;
+                        break;
+                    }
+                }
+            }
+
+            if (success) {
+                for (const auto &selectedIndex : selectedAudioIndices) {
+                    if (!appendStream(selectedIndex, false)) {
+                        success = false;
+                        break;
+                    }
+                }
+            }
+
+            if (success && streamContexts.empty()) {
+                fprintf(stderr, "Error: no streams selected for NUT output\n");
+                success = false;
+            }
+
+            if (!success && data->outputError && !data->errorMessage.empty())
+                fprintf(stderr, "%s\n", data->errorMessage.c_str());
+
+            if (success) {
+                data->nutWriter.reset(new VSPipeNUTWriter());
+                if (!data->nutWriter->initialize(data->outFile, streamInfos, data->errorMessage)) {
+                    if (!data->errorMessage.empty())
+                        fprintf(stderr, "%s\n", data->errorMessage.c_str());
+                    else
+                        fprintf(stderr, "Error: failed to initialize NUT output\n");
+                    success = false;
+                }
+            }
+
+            if (success) {
+                size_t maxBufferSize = 0;
+                int64_t totalVideoFramesExpected = 0;
+                int64_t totalAudioSamplesExpected = 0;
+
+                for (const auto &context : streamContexts) {
+                    if (context.isVideo) {
+                        size_t videoBufferSize = static_cast<size_t>(context.videoInfo->width) * static_cast<size_t>(context.videoInfo->height) * static_cast<size_t>(context.videoInfo->format.bytesPerSample);
+                        maxBufferSize = std::max(maxBufferSize, videoBufferSize);
+                        totalVideoFramesExpected += context.videoInfo->numFrames;
+                    } else {
+                        size_t audioBufferSize = static_cast<size_t>(context.audioInfo->format.numChannels) * static_cast<size_t>(VS_AUDIO_FRAME_SAMPLES) * static_cast<size_t>(context.audioInfo->format.bytesPerSample);
+                        maxBufferSize = std::max(maxBufferSize, audioBufferSize);
+                        totalAudioSamplesExpected += context.audioInfo->numSamples;
+                    }
+                }
+
+                data->buffer.resize(maxBufferSize);
+                success = !outputNutStreamsNode(opts, data.get(), streamContexts, totalVideoFramesExpected, totalAudioSamplesExpected);
             }
         } else if (nodeType == mtVideo) {
 
@@ -1694,7 +1890,7 @@ int main(int argc, char **argv) {
 
         std::chrono::duration<double> elapsedSeconds = std::chrono::steady_clock::now() - data->startTime;
         if (opts.mode == VSPipeMode::Output) {
-            if (nutAudioVideoMode)
+            if (nutOutputMode)
                 fprintf(stderr, "Output %d video frames and %" PRId64 " audio samples in %.2f seconds\n", data->totalFrames, data->totalSamples, elapsedSeconds.count());
             else if (vsapi->getNodeType(node) == mtVideo)
                 fprintf(stderr, "Output %d frames in %.2f seconds (%.2f fps)\n", data->totalFrames, elapsedSeconds.count(), data->totalFrames / elapsedSeconds.count());
@@ -1718,6 +1914,9 @@ int main(int argc, char **argv) {
         fclose(jsonFile);
     if (filterTimeGraphFile)
         fclose(filterTimeGraphFile);
+
+    for (auto &extraNode : nutExtraNodes)
+        vsapi->freeNode(extraNode);
 
     vsapi->freeNode(node);
     vsapi->freeNode(alphaNode);
