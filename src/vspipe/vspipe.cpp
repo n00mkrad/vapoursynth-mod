@@ -110,6 +110,7 @@ struct VSPipeOptions {
     bool printProgress = false;
     bool frameRefDebug = false;
     bool printFilterTime = false;
+    bool noDepWarn = false;
     std::filesystem::path scriptFilename;
     std::filesystem::path outputFilename;
     std::filesystem::path timecodesFilename;
@@ -226,6 +227,9 @@ static const char *messageTypeToString(int msgType) {
 }
 
 static void VS_CC logMessageHandler(int msgType, const char *msg, void *userData) {
+    const VSPipeOptions *opts = static_cast<const VSPipeOptions *>(userData);
+    if (opts && opts->noDepWarn && msgType == mtWarning && msg && std::string_view(msg).find("API3 which is deprecated and will be removed") != std::string_view::npos)
+        return;
 #ifdef NDEBUG
     if (msgType >= mtInformation)
 #else
@@ -715,6 +719,7 @@ static void printHelp() {
         "  -p, --progress                   Print progress to stderr\n"
         "      --filter-time                Print time spent in individual filters to stderr after processing\n"
         "      --filter-time-graph FILE     Write output node's filter graph in dot format with time information after processing\n"
+        "      --no-dep-warn                Hide API3 deprecation plugin warnings\n"
         "  -i, --info                       Print all set output node info to <outfile> and exit\n"
         "  -g  --graph <simple/full>        Print output node's filter graph in dot format to <outfile> and exit\n"
         "      --frame-ref-debug            Print frame allocation debug information\n"
@@ -779,6 +784,8 @@ static int parseOptions(VSPipeOptions &opts, int argc, char **argv) {
             opts.printProgress = true;
         } else if (argString == "--frame-ref-debug") {
             opts.frameRefDebug = true;
+        } else if (argString == "--no-dep-warn") {
+            opts.noDepWarn = true;
         } else if (argString == "--filter-time") {
             opts.printFilterTime = true;
         } else if (argString == "--filter-time-graph") {
@@ -1086,7 +1093,7 @@ int main(int argc, char **argv) {
     if (opts.mode == VSPipeMode::PrintSimpleGraph || opts.mode == VSPipeMode::PrintFullGraph || filterTimeGraphFile)
         creationFlags |= ccfEnableGraphInspection;
     VSCore *core = vsapi->createCore(creationFlags);
-    vsapi->addLogHandler(logMessageHandler, nullptr, nullptr, core);
+    vsapi->addLogHandler(logMessageHandler, nullptr, &opts, core);
     vsapi->setCoreNodeTiming(core, opts.printFilterTime || filterTimeGraphFile);
     VSScript *se = vssapi->createScript(core);
     vssapi->evalSetWorkingDir(se, 1);
