@@ -915,28 +915,28 @@ static void printHelp() {
         "  vspipe [options] <script> <outfile>\n"
         "\n"
         "Available options:\n"
-        "  -a, --arg key=value              Argument to pass to the script environment\n"
-        "  -s, --start N                    Set output frame/sample range start\n"
-        "  -e, --end N                      Set output frame/sample range end (inclusive)\n"
-        "  -o, --outputindex N              Select output index\n"
-        "      --audio-outputindex N        Select secondary audio output index for NUT muxing\n"
-        "  -r, --requests N                 Set number of concurrent frame requests\n"
+        "  -a, --arg key=value               Argument to pass to the script environment\n"
+        "  -s, --start N                     Set output frame/sample range start\n"
+        "  -e, --end N                       Set output frame/sample range end (inclusive)\n"
+        "  -o, --outputindex N               Select output index\n"
+        "  -u, --audio-outputindex N         Select secondary audio output index for NUT muxing\n"
+        "  -r, --requests N                  Set number of concurrent frame requests\n"
         "  -c, --container <y4m/nut/wav/w64> Add headers for the specified format to the output\n"
-        "                                   NUT supports single-stream video/audio and video+audio muxing, with no alpha output\n"
-        "  -t, --timecodes FILE             Write timecodes v2 file\n"
-        "  -j, --json FILE                  Write properties of output frames in json format to file\n"
-        "  -p, --progress                   Print progress to stderr\n"
-        "      --filter-time                Print time spent in individual filters to stderr after processing\n"
-        "      --filter-time-graph FILE     Write output node's filter graph in dot format with time information after processing\n"
-        "      --no-dep-warn                Hide API3 deprecation plugin warnings\n"
-        "  -i, --info                       Print all set output node info to <outfile> and exit\n"
-        "  -g  --graph <simple/full>        Print output node's filter graph in dot format to <outfile> and exit\n"
-        "      --frame-ref-debug            Print frame allocation debug information\n"
-        "  -v, --version                    Show version info and exit\n"
+        "                                    NUT supports single-stream video/audio and video+audio muxing, with no alpha output\n"
+        "  -t, --timecodes FILE              Write timecodes v2 file\n"
+        "  -j, --json FILE                   Write properties of output frames in json format to file\n"
+        "  -p, --progress                    Print progress to stderr\n"
+        "      --filter-time                 Print time spent in individual filters to stderr after processing\n"
+        "      --filter-time-graph FILE      Write output node's filter graph in dot format with time information after processing\n"
+        "      --no-dep-warn                 Hide API3 deprecation plugin warnings\n"
+        "  -i, --info                        Print all set output node info to <outfile> and exit\n"
+        "  -g  --graph <simple/full>         Print output node's filter graph in dot format to <outfile> and exit\n"
+        "      --frame-ref-debug             Print frame allocation debug information\n"
+        "  -v, --version                     Show version info and exit\n"
         "\n"
         "Special output options for <outfile>:\n"
-        "  -                                Write to stdout\n"
-        "  --                               No output\n"
+        "  -                                 Write to stdout\n"
+        "  --                                No output\n"
         "\n"
         "Examples:\n"
         "  Show script info:\n"
@@ -945,7 +945,7 @@ static void printHelp() {
         "    vspipe [options] script.vpy -\n"
 #ifdef _WIN32
         "  Write to a named pipe (Windows only):\n"
-        "    vspipe [options] script.vpy \"\\\\.\\pipe\\<pipename>\n"
+        "    vspipe [options] script.vpy \"\\\\.\\pipe\\<pipename>\"\n"
 #endif
         "  Request all frames but don't output them:\n"
         "    vspipe [options] script.vpy --\n"
@@ -1088,7 +1088,7 @@ static int parseOptions(VSPipeOptions &opts, int argc, char **argv) {
             }
 
             arg++;
-        } else if (argString == "--audio-outputindex") {
+        } else if (argString == "-u" || argString == "--audio-outputindex") {
             if (argc <= arg + 1) {
                 fprintf(stderr, "No audio output index specified\n");
                 return 1;
