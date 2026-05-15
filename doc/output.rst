@@ -36,8 +36,9 @@ Options
 ``-r, --requests N``
     Set number of concurrent frame requests
 
-``-c, --container <y4m/wav/w64>``
+``-c, --container <y4m/nut/wav/w64>``
     Add headers for the specified format to the output
+    NUT currently supports RGB video clips with fixed FPS and no alpha output.
 
 ``-t, --timecodes FILE``
     Write timecodes v2 file
@@ -78,6 +79,9 @@ Write frames 5-100 to file:
 
 Pipe to x264 and write timecodes file:
     ``vspipe script.vpy - -c y4m --timecodes timecodes.txt | x264 --demuxer y4m -o script.mkv -``
+
+Pipe RGB output in NUT to ffmpeg:
+    ``vspipe script.vpy - -c nut | ffmpeg -i - -f null -``
 
 Pass values to a script:
     ``vspipe --arg deinterlace=yes --arg "message=fluffy kittens" script.vpy output.raw``

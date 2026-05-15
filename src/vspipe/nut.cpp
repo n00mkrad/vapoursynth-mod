@@ -44,8 +44,8 @@ constexpr uint64_t kFlagInvalid = 8192;
 bool VSPipeNUTWriter::initialize(FILE *file, const VSVideoInfo *vi, std::string &errorMessage) {
     outFile = file;
     std::array<uint8_t, 4> fourCC{};
-    if (!getRGBFourCC(vi->format, fourCC)) {
-        errorMessage = "Error: no NUT fourcc exists for current RGB format";
+    if (!getVideoFourCC(vi->format, fourCC)) {
+        errorMessage = "Error: no supported NUT fourcc exists for current video format";
         return false;
     }
 
@@ -84,47 +84,90 @@ bool VSPipeNUTWriter::writeSyncpoint(int64_t pts, std::string &errorMessage) con
     return writePacket(kSyncpointStartcode, payload, errorMessage);
 }
 
-bool VSPipeNUTWriter::getRGBFourCC(const VSVideoFormat &format, std::array<uint8_t, 4> &fourCC) {
-    if (format.colorFamily != cfRGB || format.subSamplingW != 0 || format.subSamplingH != 0)
-        return false;
+bool VSPipeNUTWriter::getVideoFourCC(const VSVideoFormat &format, std::array<uint8_t, 4> &fourCC) {
+    if (format.colorFamily == cfRGB) {
+        if (format.subSamplingW != 0 || format.subSamplingH != 0)
+            return false;
 
-    uint8_t formatCode = 0;
-    if (format.sampleType == stInteger) {
-        switch (format.bitsPerSample) {
-        case 8:
-            formatCode = 8;
-            break;
-        case 9:
-            formatCode = 9;
-            break;
-        case 10:
-            formatCode = 10;
-            break;
-        case 12:
-            formatCode = 12;
-            break;
-        case 14:
-            formatCode = 14;
-            break;
-        case 16:
-            formatCode = 16;
-            break;
-        default:
+        uint8_t formatCode = 0;
+        if (format.sampleType == stInteger) {
+            switch (format.bitsPerSample) {
+            case 8:
+                formatCode = 8;
+                break;
+            case 9:
+                formatCode = 9;
+                break;
+            case 10:
+                formatCode = 10;
+                break;
+            case 12:
+                formatCode = 12;
+                break;
+            case 14:
+                formatCode = 14;
+                break;
+            case 16:
+                formatCode = 16;
+                break;
+            default:
+                return false;
+            }
+        } else if (format.sampleType == stFloat) {
+            if (format.bitsPerSample == 16)
+                formatCode = 17;
+            else if (format.bitsPerSample == 32)
+                formatCode = 33;
+            else
+                return false;
+        } else {
             return false;
         }
-    } else if (format.sampleType == stFloat) {
-        if (format.bitsPerSample == 16)
-            formatCode = 17;
-        else if (format.bitsPerSample == 32)
-            formatCode = 33;
-        else
-            return false;
-    } else {
+
+        fourCC = { 'G', '3', 0, formatCode };
+        return true;
+    }
+
+    if (format.sampleType != stInteger)
+        return false;
+
+    uint8_t bitsPerSample = 0;
+    switch (format.bitsPerSample) {
+    case 8:
+    case 9:
+    case 10:
+    case 12:
+    case 14:
+    case 16:
+        bitsPerSample = static_cast<uint8_t>(format.bitsPerSample);
+        break;
+    default:
         return false;
     }
 
-    fourCC = { 'G', '3', 0, formatCode };
-    return true;
+    if (format.colorFamily == cfGray) {
+        if (format.subSamplingW != 0 || format.subSamplingH != 0)
+            return false;
+        fourCC = { 'Y', '1', 0, bitsPerSample };
+        return true;
+    }
+
+    if (format.colorFamily == cfYUV) {
+        uint8_t subSamplingCode = 0;
+        if (format.subSamplingW == 1 && format.subSamplingH == 1)
+            subSamplingCode = 11;
+        else if (format.subSamplingW == 1 && format.subSamplingH == 0)
+            subSamplingCode = 10;
+        else if (format.subSamplingW == 0 && format.subSamplingH == 0)
+            subSamplingCode = 0;
+        else
+            return false;
+
+        fourCC = { 'Y', '3', subSamplingCode, bitsPerSample };
+        return true;
+    }
+
+    return false;
 }
 
 uint32_t VSPipeNUTWriter::crc32(const uint8_t *buf, size_t len) {

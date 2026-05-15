@@ -527,10 +527,6 @@ static bool initializeVideoOutput(VSPipeOutputData *data) {
         }
     } else if (data->outputHeaders == VSPipeHeaders::NUT) {
         std::array<uint8_t, 4> fourCC{};
-        if (vi->format.colorFamily != cfRGB) {
-            fprintf(stderr, "Error: NUT output in v1 only supports RGB clips\n");
-            return false;
-        }
         if (data->alphaNode) {
             fprintf(stderr, "Error: NUT output in v1 does not support alpha output\n");
             return false;
@@ -539,8 +535,8 @@ static bool initializeVideoOutput(VSPipeOutputData *data) {
             fprintf(stderr, "Error: NUT output in v1 requires a fixed and known fps\n");
             return false;
         }
-        if (!VSPipeNUTWriter::getRGBFourCC(vi->format, fourCC)) {
-            fprintf(stderr, "Error: no NUT fourcc exists for current RGB format\n");
+        if (!VSPipeNUTWriter::getVideoFourCC(vi->format, fourCC)) {
+            fprintf(stderr, "Error: no supported NUT fourcc exists for current video format\n");
             return false;
         }
 
@@ -592,7 +588,7 @@ static bool finalizeVideoOutput(VSPipeOutputData *data) {
 
 static bool initializeAudioOutput(VSPipeOutputData *data) {
     if (data->outputHeaders == VSPipeHeaders::NUT) {
-        fprintf(stderr, "Error: NUT output in v1 only supports RGB video clips\n");
+        fprintf(stderr, "Error: NUT output in v1 only supports video output\n");
         return false;
     }
 
@@ -713,7 +709,7 @@ static void printHelp() {
         "  -o, --outputindex N              Select output index\n"
         "  -r, --requests N                 Set number of concurrent frame requests\n"
         "  -c, --container <y4m/nut/wav/w64> Add headers for the specified format to the output\n"
-        "                                   NUT currently supports RGB clips with fixed fps and no alpha output\n"
+        "                                   NUT currently supports RGB/YUV/Gray clips with fixed fps and no alpha output\n"
         "  -t, --timecodes FILE             Write timecodes v2 file\n"
         "  -j, --json FILE                  Write properties of output frames in json format to file\n"
         "  -p, --progress                   Print progress to stderr\n"

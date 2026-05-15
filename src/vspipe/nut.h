@@ -34,7 +34,7 @@ public:
     bool initialize(FILE *outFile, const VSVideoInfo *vi, std::string &errorMessage);
     bool writeFrameHeader(int64_t pts, size_t frameSize, bool keyFrame, std::string &errorMessage);
 
-    static bool getRGBFourCC(const VSVideoFormat &format, std::array<uint8_t, 4> &fourCC);
+    static bool getVideoFourCC(const VSVideoFormat &format, std::array<uint8_t, 4> &fourCC);
 
 private:
     static uint32_t crc32(const uint8_t *buf, size_t len);
