@@ -34,8 +34,6 @@ constexpr uint64_t kMaxDistance = 32768;
 constexpr uint64_t kVideoClass = 0;
 constexpr uint64_t kAudioClass = 1;
 constexpr uint64_t kStreamFlagsNone = 0;
-constexpr uint64_t kTimebaseNum = 1;
-constexpr uint64_t kTimebaseDen = 1000000;
 constexpr uint64_t kMaxPtsDistance = 1000000;
 constexpr uint64_t kFlagKey = 1;
 constexpr uint64_t kFlagCodedPts = 8;
@@ -46,13 +44,19 @@ constexpr uint64_t kFlagInvalid = 8192;
 
 }
 
-bool VSPipeNUTWriter::initialize(FILE *file, const std::vector<VSPipeNUTStreamInfo> &streams, std::string &errorMessage) {
+bool VSPipeNUTWriter::initialize(FILE *file, const std::vector<VSPipeNUTStreamInfo> &streams, const VSPipeNUTWriterOptions &initOptions, std::string &errorMessage) {
     if (streams.empty()) {
         errorMessage = "Error: NUT stream list is empty";
         return false;
     }
 
     outFile = file;
+    options = initOptions;
+    if (options.timebaseNum <= 0 || options.timebaseDen <= 0) {
+        options.timebaseNum = 1;
+        options.timebaseDen = 1000000;
+    }
+    bytesWritten = 0;
     lastSyncpointPosition = -1;
 
     if (!writeBuffer(std::vector<uint8_t>(kNutIdString, kNutIdString + sizeof(kNutIdString)), "initial NUT identifier", errorMessage))
@@ -78,8 +82,19 @@ bool VSPipeNUTWriter::writeFrameHeader(int streamId, int64_t pts, size_t frameSi
         return false;
     }
 
-    if (!writeSyncpoint(pts, errorMessage))
-        return false;
+    if (options.syncpointMode == VSPipeNUTSyncpointMode::PerFrame) {
+        if (!writeSyncpoint(pts, errorMessage))
+            return false;
+    } else {
+        constexpr uint64_t kFrameHeaderReserve = 32;
+        uint64_t syncpointDistance = 0;
+        if (lastSyncpointPosition >= 0 && bytesWritten >= lastSyncpointPosition)
+            syncpointDistance = static_cast<uint64_t>(bytesWritten - lastSyncpointPosition);
+        if (syncpointDistance + frameSize + kFrameHeaderReserve > kMaxDistance) {
+            if (!writeSyncpoint(pts, errorMessage))
+                return false;
+        }
+    }
 
     std::vector<uint8_t> frameHeader;
     frameHeader.reserve(64);
@@ -94,14 +109,10 @@ bool VSPipeNUTWriter::writeFrameHeader(int streamId, int64_t pts, size_t frameSi
 }
 
 bool VSPipeNUTWriter::writeSyncpoint(int64_t pts, std::string &errorMessage) {
-    long syncpointPos = std::ftell(outFile);
-    if (syncpointPos < 0) {
-        errorMessage = "Error: ftell() failed while preparing NUT syncpoint, errno: " + std::to_string(errno);
-        return false;
-    }
+    int64_t syncpointPos = bytesWritten;
 
     uint64_t backPtrDiv16 = 0;
-    if (lastSyncpointPosition >= 0 && syncpointPos > lastSyncpointPosition)
+    if (!options.forceZeroBackPointers && lastSyncpointPosition >= 0 && syncpointPos > lastSyncpointPosition)
         backPtrDiv16 = static_cast<uint64_t>(syncpointPos - lastSyncpointPosition) / 16;
 
     std::vector<uint8_t> payload;
@@ -112,6 +123,10 @@ bool VSPipeNUTWriter::writeSyncpoint(int64_t pts, std::string &errorMessage) {
         return false;
     lastSyncpointPosition = syncpointPos;
     return true;
+}
+
+void VSPipeNUTWriter::notePayloadWritten(size_t bytes) {
+    bytesWritten += static_cast<int64_t>(bytes);
 }
 
 bool VSPipeNUTWriter::getVideoFourCC(const VSVideoFormat &format, std::array<uint8_t, 4> &fourCC) {
@@ -309,7 +324,7 @@ void VSPipeNUTWriter::appendVB(std::vector<uint8_t> &dst, const uint8_t *data, s
     dst.insert(dst.end(), data, data + len);
 }
 
-bool VSPipeNUTWriter::writeBuffer(const std::vector<uint8_t> &buffer, const char *context, std::string &errorMessage) const {
+bool VSPipeNUTWriter::writeBuffer(const std::vector<uint8_t> &buffer, const char *context, std::string &errorMessage) {
     if (!outFile || buffer.empty())
         return true;
 
@@ -318,10 +333,11 @@ bool VSPipeNUTWriter::writeBuffer(const std::vector<uint8_t> &buffer, const char
         return false;
     }
 
+    bytesWritten += static_cast<int64_t>(buffer.size());
     return true;
 }
 
-bool VSPipeNUTWriter::writePacket(uint64_t startcode, const std::vector<uint8_t> &payload, std::string &errorMessage) const {
+bool VSPipeNUTWriter::writePacket(uint64_t startcode, const std::vector<uint8_t> &payload, std::string &errorMessage) {
     std::vector<uint8_t> packet;
     packet.reserve(32 + payload.size());
 
@@ -337,7 +353,7 @@ bool VSPipeNUTWriter::writePacket(uint64_t startcode, const std::vector<uint8_t>
     return writeBuffer(packet, "NUT packet", errorMessage);
 }
 
-bool VSPipeNUTWriter::writeMainHeader(const std::vector<VSPipeNUTStreamInfo> &streams, std::string &errorMessage) const {
+bool VSPipeNUTWriter::writeMainHeader(const std::vector<VSPipeNUTStreamInfo> &streams, std::string &errorMessage) {
     std::vector<uint8_t> payload;
     payload.reserve(128);
 
@@ -346,8 +362,8 @@ bool VSPipeNUTWriter::writeMainHeader(const std::vector<VSPipeNUTStreamInfo> &st
     appendV(payload, kMaxDistance);
 
     appendV(payload, 1);
-    appendV(payload, kTimebaseNum);
-    appendV(payload, kTimebaseDen);
+    appendV(payload, static_cast<uint64_t>(options.timebaseNum));
+    appendV(payload, static_cast<uint64_t>(options.timebaseDen));
 
     appendV(payload, kFlagInvalid);
     appendV(payload, 0);
@@ -373,7 +389,7 @@ bool VSPipeNUTWriter::writeMainHeader(const std::vector<VSPipeNUTStreamInfo> &st
     return writePacket(kMainStartcode, payload, errorMessage);
 }
 
-bool VSPipeNUTWriter::writeStreamHeader(int streamId, const VSPipeNUTStreamInfo &stream, std::string &errorMessage) const {
+bool VSPipeNUTWriter::writeStreamHeader(int streamId, const VSPipeNUTStreamInfo &stream, std::string &errorMessage) {
     if (streamId < 0) {
         errorMessage = "Error: invalid negative NUT stream id";
         return false;
@@ -407,7 +423,7 @@ bool VSPipeNUTWriter::writeStreamHeader(int streamId, const VSPipeNUTStreamInfo 
     return writePacket(kStreamStartcode, payload, errorMessage);
 }
 
-bool VSPipeNUTWriter::writeInfoPacketUTF8(int streamId, const std::string &name, const std::string &value, std::string &errorMessage) const {
+bool VSPipeNUTWriter::writeInfoPacketUTF8(int streamId, const std::string &name, const std::string &value, std::string &errorMessage) {
     if (streamId < 0) {
         errorMessage = "Error: invalid negative NUT stream id";
         return false;
@@ -428,7 +444,7 @@ bool VSPipeNUTWriter::writeInfoPacketUTF8(int streamId, const std::string &name,
     return writePacket(kInfoStartcode, payload, errorMessage);
 }
 
-bool VSPipeNUTWriter::writeStreamInfo(int streamId, const VSPipeNUTStreamInfo &stream, std::string &errorMessage) const {
+bool VSPipeNUTWriter::writeStreamInfo(int streamId, const VSPipeNUTStreamInfo &stream, std::string &errorMessage) {
     if (stream.type != VSPipeNUTStreamType::Video)
         return true;
     if (!stream.hasRFrameRate || stream.rFrameRateNum <= 0 || stream.rFrameRateDen <= 0)

@@ -121,6 +121,8 @@ struct VSPipeOptions {
     bool printFilterTime = false;
     bool noDepWarn = false;
     bool nutForceCfr = false;
+    bool nutRelaxedSyncpoints = false;
+    bool nutZeroBackPointers = false;
     std::filesystem::path scriptFilename;
     std::filesystem::path outputFilename;
     std::filesystem::path timecodesFilename;
@@ -189,6 +191,8 @@ struct VSPipeOutputData {
     int64_t nutFallbackDurationTicks = 1;
     int64_t nutAudioSamplesWritten = 0;
 };
+
+static VSPipeNUTWriterOptions getNutWriterOptions(const VSPipeOptions &opts, const VSPipeOutputData &data);
 
 /////////////////////////////////////////////
 
@@ -263,6 +267,7 @@ static void outputFrame(const VSFrame *frame, VSPipeOutputData *data) {
         if (data->vsapi->getFrameType(frame) == mtVideo) {
             const VSVideoFormat *fi = data->vsapi->getVideoFrameFormat(frame);
             const int rgbRemap[] = { 1, 2, 0 };
+            size_t framePayloadBytes = 0;
             for (int rp = 0; rp < fi->numPlanes; rp++) {
                 int p = (fi->colorFamily == cfRGB) ? rgbRemap[rp] : rp;
                 ptrdiff_t stride = data->vsapi->getStride(frame, p);
@@ -283,7 +288,10 @@ static void outputFrame(const VSFrame *frame, VSPipeOutputData *data) {
                     data->outputError = true;
                     break;
                 }
+                framePayloadBytes += static_cast<size_t>(rowSize) * static_cast<size_t>(height);
             }
+            if (!data->outputError && data->outputHeaders == VSPipeHeaders::NUT && data->nutWriter)
+                data->nutWriter->notePayloadWritten(framePayloadBytes);
         } else if (data->vsapi->getFrameType(frame) == mtAudio) {
             const VSAudioFormat *fi = data->vsapi->getAudioFrameFormat(frame);
 
@@ -310,6 +318,8 @@ static void outputFrame(const VSFrame *frame, VSPipeOutputData *data) {
                 data->totalFrames = data->requestedFrames;
                 data->outputError = true;
             }
+            if (!data->outputError && data->outputHeaders == VSPipeHeaders::NUT && data->nutWriter)
+                data->nutWriter->notePayloadWritten(toOutput);
         }
     }
 }
@@ -722,7 +732,7 @@ static std::string floatBitsToLetter(int bits) {
     }
 }
 
-static bool initializeVideoOutput(VSPipeOutputData *data) {
+static bool initializeVideoOutput(const VSPipeOptions &opts, VSPipeOutputData *data) {
     if (data->outputHeaders != VSPipeHeaders::None && data->outputHeaders != VSPipeHeaders::Y4M && data->outputHeaders != VSPipeHeaders::NUT) {
         fprintf(stderr, "Error: can't apply selected header type to video\n");
         return false;
@@ -792,6 +802,19 @@ static bool initializeVideoOutput(VSPipeOutputData *data) {
             return false;
         }
 
+        data->nutTimebaseNum = 1;
+        data->nutTimebaseDen = 1000000;
+        if (opts.nutForceCfr) {
+            int64_t normalizedFpsNum = 0;
+            int64_t normalizedFpsDen = 1;
+            if (!normalizePositiveRational(vi->fpsNum, vi->fpsDen, normalizedFpsNum, normalizedFpsDen)) {
+                fprintf(stderr, "Error: --cfr requires a valid nominal FPS\n");
+                return false;
+            }
+            data->nutTimebaseNum = normalizedFpsDen;
+            data->nutTimebaseDen = normalizedFpsNum;
+        }
+
         data->nutFrameSize = getNutVideoFrameSize(vi);
         data->nutCurrentPts = 0;
         data->nutFallbackDurationTicks = 1;
@@ -806,7 +829,7 @@ static bool initializeVideoOutput(VSPipeOutputData *data) {
         streamInfo.height = vi->height;
         std::vector<VSPipeNUTStreamInfo> streams;
         streams.push_back(streamInfo);
-        if (!data->nutWriter->initialize(data->outFile, streams, data->errorMessage)) {
+        if (!data->nutWriter->initialize(data->outFile, streams, getNutWriterOptions(opts, *data), data->errorMessage)) {
             if (!data->errorMessage.empty())
                 fprintf(stderr, "%s\n", data->errorMessage.c_str());
             else
@@ -844,7 +867,7 @@ static bool finalizeVideoOutput(VSPipeOutputData *data) {
     return true;
 }
 
-static bool initializeAudioOutput(VSPipeOutputData *data) {
+static bool initializeAudioOutput(const VSPipeOptions &opts, VSPipeOutputData *data) {
     if (data->outputHeaders != VSPipeHeaders::None && data->outputHeaders != VSPipeHeaders::WAVE && data->outputHeaders != VSPipeHeaders::WAVE64 && data->outputHeaders != VSPipeHeaders::NUT) {
         fprintf(stderr, "Error: can't apply selected header type to audio\n");
         return false;
@@ -901,7 +924,7 @@ static bool initializeAudioOutput(VSPipeOutputData *data) {
         streamInfo.channelCount = ai->format.numChannels;
         std::vector<VSPipeNUTStreamInfo> streams;
         streams.push_back(streamInfo);
-        if (!data->nutWriter->initialize(data->outFile, streams, data->errorMessage)) {
+        if (!data->nutWriter->initialize(data->outFile, streams, getNutWriterOptions(opts, *data), data->errorMessage)) {
             if (!data->errorMessage.empty())
                 fprintf(stderr, "%s\n", data->errorMessage.c_str());
             else
@@ -1008,6 +1031,15 @@ static bool svToIntList(const std::string_view &s, std::vector<int> &result) {
     return !result.empty();
 }
 
+static VSPipeNUTWriterOptions getNutWriterOptions(const VSPipeOptions &opts, const VSPipeOutputData &data) {
+    VSPipeNUTWriterOptions writerOptions;
+    writerOptions.syncpointMode = opts.nutRelaxedSyncpoints ? VSPipeNUTSyncpointMode::MaxDistance : VSPipeNUTSyncpointMode::PerFrame;
+    writerOptions.forceZeroBackPointers = opts.nutZeroBackPointers;
+    writerOptions.timebaseNum = data.nutTimebaseNum;
+    writerOptions.timebaseDen = data.nutTimebaseDen;
+    return writerOptions;
+}
+
 static bool printVersion(const VSAPI *vsapi) {
     VSCore *core = vsapi->createCore(0);
     if (!core) {
@@ -1036,6 +1068,8 @@ static void printHelp() {
         "  -r, --requests N                  Set number of concurrent frame requests\n"
         "  -c, --container <y4m/nut/wav/w64> Add headers for the specified format to the output (use nut to carry multiple streams)\n"
         "      --cfr                         Force CFR timestamps for NUT video streams\n"
+        "      --nut-relaxed-syncpoints      Experimental: write NUT syncpoints only when max_distance requires it\n"
+        "      --nut-zero-back-ptr           Experimental: force NUT syncpoint back_ptr_div16 to zero\n"
         "  -t, --timecodes FILE              Write timecodes v2 file\n"
         "  -j, --json FILE                   Write properties of output frames in json format to file\n"
         "  -p, --progress                    Print progress to stderr\n"
@@ -1235,6 +1269,10 @@ static int parseOptions(VSPipeOptions &opts, int argc, char **argv) {
             arg++;
         } else if (argString == "--cfr") {
             opts.nutForceCfr = true;
+        } else if (argString == "--nut-relaxed-syncpoints") {
+            opts.nutRelaxedSyncpoints = true;
+        } else if (argString == "--nut-zero-back-ptr") {
+            opts.nutZeroBackPointers = true;
         } else if (argString == "-a" || argString == "--arg") {
             if (argc <= arg + 1) {
                 fprintf(stderr, "No argument specified\n");
@@ -1354,6 +1392,14 @@ int main(int argc, char **argv) {
         return parseResult;
     if (opts.mode == VSPipeMode::Output && opts.nutForceCfr && opts.outputHeaders != VSPipeHeaders::NUT) {
         fprintf(stderr, "Error: --cfr can only be used together with -c nut\n");
+        return 1;
+    }
+    if (opts.mode == VSPipeMode::Output && opts.nutRelaxedSyncpoints && opts.outputHeaders != VSPipeHeaders::NUT) {
+        fprintf(stderr, "Error: --nut-relaxed-syncpoints can only be used together with -c nut\n");
+        return 1;
+    }
+    if (opts.mode == VSPipeMode::Output && opts.nutZeroBackPointers && opts.outputHeaders != VSPipeHeaders::NUT) {
+        fprintf(stderr, "Error: --nut-zero-back-ptr can only be used together with -c nut\n");
         return 1;
     }
     if (opts.mode == VSPipeMode::Output && !opts.audioOutputIndices.empty() && opts.outputHeaders != VSPipeHeaders::NUT) {
@@ -1785,6 +1831,8 @@ int main(int argc, char **argv) {
                             cfrGlobalNum = normalizedFpsNum;
                             cfrGlobalDen = normalizedFpsDen;
                             cfrGlobalSet = true;
+                            data->nutTimebaseNum = cfrGlobalDen;
+                            data->nutTimebaseDen = cfrGlobalNum;
                         } else if (normalizedFpsNum != cfrGlobalNum || normalizedFpsDen != cfrGlobalDen) {
                             data->errorMessage = "Error: --cfr requires all selected video streams to have identical FPS";
                             data->outputError = true;
@@ -1899,7 +1947,7 @@ int main(int argc, char **argv) {
 
             if (success) {
                 data->nutWriter.reset(new VSPipeNUTWriter());
-                if (!data->nutWriter->initialize(data->outFile, streamInfos, data->errorMessage)) {
+                if (!data->nutWriter->initialize(data->outFile, streamInfos, getNutWriterOptions(opts, *data), data->errorMessage)) {
                     if (!data->errorMessage.empty())
                         fprintf(stderr, "%s\n", data->errorMessage.c_str());
                     else
@@ -1942,7 +1990,7 @@ int main(int argc, char **argv) {
 
             data->totalFrames = vi->numFrames;
 
-            success = initializeVideoOutput(data.get());
+            success = initializeVideoOutput(opts, data.get());
             if (success) {
                 data->lastFPSReportTime = std::chrono::steady_clock::now();
                 success = !outputNode(opts, data.get(), vssapi->getCore(se));
@@ -1957,7 +2005,7 @@ int main(int argc, char **argv) {
             data->totalFrames = ai->numFrames;
             data->totalSamples = ai->numSamples;
 
-            success = initializeAudioOutput(data.get());
+            success = initializeAudioOutput(opts, data.get());
             if (success)                
                 success = !outputNode(opts, data.get(), vssapi->getCore(se));
         }

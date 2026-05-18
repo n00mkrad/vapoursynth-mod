@@ -50,10 +50,23 @@ struct VSPipeNUTStreamInfo {
     int64_t rFrameRateDen = 1;
 };
 
+enum class VSPipeNUTSyncpointMode {
+    PerFrame,
+    MaxDistance
+};
+
+struct VSPipeNUTWriterOptions {
+    VSPipeNUTSyncpointMode syncpointMode = VSPipeNUTSyncpointMode::PerFrame;
+    bool forceZeroBackPointers = false;
+    int64_t timebaseNum = 1;
+    int64_t timebaseDen = 1000000;
+};
+
 class VSPipeNUTWriter {
 public:
-    bool initialize(FILE *outFile, const std::vector<VSPipeNUTStreamInfo> &streams, std::string &errorMessage);
+    bool initialize(FILE *outFile, const std::vector<VSPipeNUTStreamInfo> &streams, const VSPipeNUTWriterOptions &options, std::string &errorMessage);
     bool writeFrameHeader(int streamId, int64_t pts, size_t frameSize, bool keyFrame, std::string &errorMessage);
+    void notePayloadWritten(size_t bytes);
 
     static bool getVideoFourCC(const VSVideoFormat &format, std::array<uint8_t, 4> &fourCC);
     static bool getAudioFourCC(const VSAudioFormat &format, std::array<uint8_t, 4> &fourCC);
@@ -66,17 +79,19 @@ private:
     static void appendU64(std::vector<uint8_t> &dst, uint64_t value);
     static void appendVB(std::vector<uint8_t> &dst, const uint8_t *data, size_t len);
 
-    bool writeBuffer(const std::vector<uint8_t> &buffer, const char *context, std::string &errorMessage) const;
-    bool writePacket(uint64_t startcode, const std::vector<uint8_t> &payload, std::string &errorMessage) const;
+    bool writeBuffer(const std::vector<uint8_t> &buffer, const char *context, std::string &errorMessage);
+    bool writePacket(uint64_t startcode, const std::vector<uint8_t> &payload, std::string &errorMessage);
     bool writeSyncpoint(int64_t pts, std::string &errorMessage);
-    bool writeMainHeader(const std::vector<VSPipeNUTStreamInfo> &streams, std::string &errorMessage) const;
-    bool writeStreamHeader(int streamId, const VSPipeNUTStreamInfo &stream, std::string &errorMessage) const;
-    bool writeInfoPacketUTF8(int streamId, const std::string &name, const std::string &value, std::string &errorMessage) const;
-    bool writeStreamInfo(int streamId, const VSPipeNUTStreamInfo &stream, std::string &errorMessage) const;
+    bool writeMainHeader(const std::vector<VSPipeNUTStreamInfo> &streams, std::string &errorMessage);
+    bool writeStreamHeader(int streamId, const VSPipeNUTStreamInfo &stream, std::string &errorMessage);
+    bool writeInfoPacketUTF8(int streamId, const std::string &name, const std::string &value, std::string &errorMessage);
+    bool writeStreamInfo(int streamId, const VSPipeNUTStreamInfo &stream, std::string &errorMessage);
     bool writeInitialSyncpoint(std::string &errorMessage);
 
     FILE *outFile = nullptr;
+    VSPipeNUTWriterOptions options{};
     int msbPtsShift = 8;
+    int64_t bytesWritten = 0;
     int64_t lastSyncpointPosition = -1;
 };
 
